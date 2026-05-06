@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import time
+
 from vllm.v1.engine import EngineCoreEventType
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+
+_STATS_INTERVAL_S = 1.0
 
 
 class OmniSchedulerMixin:
@@ -31,3 +36,14 @@ class OmniSchedulerMixin:
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
+        now = time.monotonic()
+        if now - getattr(self, "_last_stats_time", 0.0) < _STATS_INTERVAL_S:
+            return None
+        self._last_stats_time = now
+        return SchedulerStats(
+            kv_cache_usage=self.kv_cache_manager.usage,
+            num_running_reqs=len(self.running),
+            num_waiting_reqs=len(self.waiting),
+        )

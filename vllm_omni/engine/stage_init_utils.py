@@ -660,7 +660,7 @@ def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_conf
         )
     return MultimodalOutputProcessor(
         tokenizer=tokenizer,
-        log_stats=False,
+        log_stats=True,
         engine_core_output_type=metadata.engine_output_type,
     )
 

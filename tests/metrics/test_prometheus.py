@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+import re
+
+import pytest
+from prometheus_client import REGISTRY, CollectorRegistry, generate_latest
+
+from vllm_omni.metrics import OmniPrometheusMetrics
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+_MODEL = "test-model"
+
+_PIPELINE_METRICS = [
+    "vllm:omni_num_requests_running",
+    "vllm:omni_num_requests_waiting",
+    "vllm:omni_num_requests_success",
+    "vllm:omni_num_requests_fail",
+    "vllm:omni_e2e_request_latency_seconds",
+    "vllm:omni_request_queue_time_seconds",
+]
+
+_DIFFUSION_METRICS = [
+    "vllm:omni_diffusion_preprocess_time_ms",
+    "vllm:omni_diffusion_exec_time_ms",
+    "vllm:omni_diffusion_postprocess_time_ms",
+    "vllm:omni_diffusion_step_time_ms",
+]
+
+
+@pytest.fixture(scope="module")
+def registry() -> CollectorRegistry:
+    return REGISTRY
+
+
+@pytest.fixture(scope="module")
+def prom() -> OmniPrometheusMetrics:
+    return OmniPrometheusMetrics(model_name=_MODEL)
+
+
+@pytest.fixture(scope="module")
+def scrape_output(prom: OmniPrometheusMetrics, registry: CollectorRegistry) -> str:
+    prom.request_succeeded(e2e_seconds=1.5, queue_seconds=0.3)
+    prom.request_succeeded(e2e_seconds=2.0, queue_seconds=0.5)
+    prom.request_failed()
+    prom.set_running(5)
+    prom.set_waiting(2)
+    prom.observe_diffusion_metrics(
+        stage_id=1,
+        metrics={
+            "preprocess_time_ms": 10.0,
+            "diffusion_engine_exec_time_ms": 200.0,
+            "postprocess_time_ms": 15.0,
+            "diffusion_engine_total_time_ms": 225.0,
+        },
+    )
+    return generate_latest(registry).decode()
+
+
+def _sample_value(output: str, metric_line: str) -> float | None:
+    for line in output.splitlines():
+        if line.startswith(metric_line):
+            return float(line.split()[-1])
+    return None
+
+
+class TestMetricObservation:
+    def test_all_metric_families_present(self, scrape_output: str) -> None:
+        for name in _PIPELINE_METRICS + _DIFFUSION_METRICS:
+            assert f"# HELP {name}" in scrape_output, f"missing metric family: {name}"
+
+    def test_counter_values(self, scrape_output: str) -> None:
+        success = _sample_value(
+            scrape_output,
+            f'vllm:omni_num_requests_success_total{{model_name="{_MODEL}"}}',
+        )
+        assert success == 2.0
+
+        fail = _sample_value(
+            scrape_output,
+            f'vllm:omni_num_requests_fail_total{{model_name="{_MODEL}"}}',
+        )
+        assert fail == 1.0
+
+    def test_gauge_values(self, scrape_output: str) -> None:
+        running = _sample_value(
+            scrape_output,
+            f'vllm:omni_num_requests_running{{model_name="{_MODEL}"}}',
+        )
+        assert running == 5.0
+
+        waiting = _sample_value(
+            scrape_output,
+            f'vllm:omni_num_requests_waiting{{model_name="{_MODEL}"}}',
+        )
+        assert waiting == 2.0
+
+    def test_histogram_counts(self, scrape_output: str) -> None:
+        e2e_count = _sample_value(
+            scrape_output,
+            f'vllm:omni_e2e_request_latency_seconds_count{{model_name="{_MODEL}"}}',
+        )
+        assert e2e_count == 2.0
+
+        queue_count = _sample_value(
+            scrape_output,
+            f'vllm:omni_request_queue_time_seconds_count{{model_name="{_MODEL}"}}',
+        )
+        assert queue_count == 2.0
+
+    def test_diffusion_histogram_counts(self, scrape_output: str) -> None:
+        for name in _DIFFUSION_METRICS:
+            count = _sample_value(
+                scrape_output,
+                f'{name}_count{{engine="1",model_name="{_MODEL}"}}',
+            )
+            assert count == 1.0, f"{name}_count expected 1.0, got {count}"
+
+
+class TestLabelCorrectness:
+    def test_pipeline_metrics_carry_model_name(self, scrape_output: str) -> None:
+        for name in _PIPELINE_METRICS:
+            pattern = rf'^{re.escape(name)}.*model_name="{re.escape(_MODEL)}"'
+            assert re.search(pattern, scrape_output, re.MULTILINE), f"{name} missing model_name label"
+
+    def test_diffusion_metrics_carry_engine_label(self, scrape_output: str) -> None:
+        for name in _DIFFUSION_METRICS:
+            pattern = rf'^{re.escape(name)}.*engine="1".*model_name="{re.escape(_MODEL)}"'
+            assert re.search(pattern, scrape_output, re.MULTILINE), f"{name} missing engine label"
+
+    def test_no_stage_id_label(self, scrape_output: str) -> None:
+        assert "stage_id=" not in scrape_output
+
+
+class TestScrapeOutput:
+    def test_omni_metrics_in_default_registry(self, scrape_output: str) -> None:
+        for name in _PIPELINE_METRICS + _DIFFUSION_METRICS:
+            assert name in scrape_output
+
+    def test_process_metrics_in_default_registry(self, scrape_output: str) -> None:
+        # vllm:* metrics require a full PrometheusStatLogger with VllmConfig
+        # and are registered by the Orchestrator at server startup. Verifying
+        # their presence is covered by integration tests. Here we confirm the
+        # default registry is being scraped by checking for process_* metrics
+        # from the Python prometheus_client runtime.
+        assert "process_" in scrape_output

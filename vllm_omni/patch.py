@@ -1,3 +1,4 @@
+import logging
 import sys
 from functools import cached_property
 
@@ -123,3 +124,29 @@ for module_name, module in list(sys.modules.items()):
         module.StreamingUpdate = OmniStreamingUpdate
     if hasattr(module, "EngineCoreRequest") and module.EngineCoreRequest == _OriginalEngineCoreRequest:
         module.EngineCoreRequest = OmniEngineCoreRequest
+
+# =============================================================================
+# Patch unregister_vllm_metrics to a no-op
+# =============================================================================
+# WHY: unregister_vllm_metrics() uses `"vllm" in collector._name` to strip
+# collectors from the Prometheus registry.  This destroys any vllm-omni
+# metrics that use the vllm: namespace.
+#
+# REMOVAL: Remove this patch once upstream vLLM adds
+# _STAT_LOGGER_METRIC_NAMES to vllm.v1.metrics.prometheus and scopes
+# unregister_vllm_metrics() to that set.  Track:
+# https://github.com/vllm-project/vllm/pull/42331
+import vllm.v1.metrics.prometheus as _vllm_prometheus
+
+_logger = logging.getLogger(__name__)
+
+
+def _noop_unregister_vllm_metrics():
+    pass
+
+
+_vllm_prometheus.unregister_vllm_metrics = _noop_unregister_vllm_metrics
+_logger.warning(
+    "Monkey-patched unregister_vllm_metrics() to a no-op. "
+    "Remove this patch once vLLM adds _STAT_LOGGER_METRIC_NAMES."
+)
