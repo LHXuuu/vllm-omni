@@ -39,6 +39,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.outputs import CompletionOutput, RequestOutput
+
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.outputs import OmniRequestOutput
 
