@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import math
 import os
 import random
 from collections.abc import Callable, Mapping
@@ -184,7 +185,7 @@ class DiffusionParallelConfig:
     """
 
     cfg_parallel_size: int = 1
-    """Number of Classifier Free Guidance (CFG) parallel groups."""
+    """Number of ranks used to execute guidance passes in parallel."""
 
     vae_patch_parallel_size: int = 1
     """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
@@ -232,9 +233,6 @@ class DiffusionParallelConfig:
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
-        assert self.cfg_parallel_size in [1, 2, 3], (
-            f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
-        )
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         assert self.vae_parallel_mode in {"tile", "spatial_shard_height", "spatial_shard_width"}, (
             "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
@@ -1070,6 +1068,19 @@ class OmniDiffusionConfig:
         """
         self.tf_model_config = tf_config
         self._propagate_quantization_from_tf_config(tf_config)
+        self._propagate_skip_softmax_calibration(tf_config)
+
+    def _propagate_skip_softmax_calibration(self, tf_config: "TransformerConfig") -> None:
+        cfg = getattr(self, "diffusion_attention_config", None)
+        if not isinstance(cfg, AttentionConfig):
+            return
+        specs = [s for s in (cfg.default, *cfg.per_role.values()) if s is not None]
+
+        from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
+            propagate_skip_softmax_calibration,
+        )
+
+        propagate_skip_softmax_calibration(specs, self.model, tf_config)
 
     def update_multimodal_support(self) -> None:
         # Resolve serving-visible multimodal behavior from shared metadata
@@ -1259,6 +1270,7 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
+    async_output_id: str | None = None
     error: str | None = None
     error_status_code: int | None = None
     error_type: str | None = None
@@ -1319,27 +1331,113 @@ class DiffusionOutput:
         )
 
 
+class AsyncOutputKind(Enum):
+    """Message kind for ``AsyncDiffusionOutput`` — routes async results.
+
+    * ``RPC_RESULT`` — ordinary RPC return (sleep, wake, profile, etc.)
+    * ``COMPUTE_DONE`` — worker forward finished, GPU can start next request
+    * ``OUTPUT_READY`` — background D2H/SHM packing finished, final output
+      is available via ``async_output_id``
+    """
+
+    RPC_RESULT = "rpc_result"
+    COMPUTE_DONE = "compute_done"
+    OUTPUT_READY = "output_ready"
+
+
+@dataclass
+class AsyncDiffusionOutput:
+    """Async protocol envelope for ``result_mq`` messages.
+
+    In request-mode (``step_execution=False``), all ``result_mq``
+    messages use this envelope.  The ``kind`` field routes the message
+    to the correct consumer.
+    """
+
+    kind: AsyncOutputKind
+    rpc_id: str | None = None
+    async_output_id: str | None = None
+    result: Any | None = None
+    output: DiffusionOutput | None = None
+    error: str | None = None
+
+
 class DiffusionRequestAbortedError(RuntimeError):
     """Raised when a diffusion request ends via user-visible abort."""
 
 
+def _in_range(value: Any, name: str, lo: float, hi: float | None) -> float | None:
+    """Validate an optional numeric control at config-parse time."""
+    if value is None:
+        return None
+    x = float(value)
+    if not math.isfinite(x) or x < lo or (hi is not None and x > hi):
+        rng = f"in [{lo}, {hi}]" if hi is not None else f">= {lo}"
+        raise ValueError(f"{name} must be finite and {rng}; got {value!r}.")
+    return x
+
+
+@dataclass
+class SkipSoftmaxSpec:
+    """User-facing skip-softmax controls for the TRTLLM_ATTN backend.
+
+    ``target_sparsity`` uses the checkpoint's calibrated curve (a·exp(b·s)); ``threshold``
+    is the calibration-free absolute skip threshold. They are mutually exclusive.
+    """
+
+    target_sparsity: float | None = None
+    threshold: float | None = None
+    disabled_until_timestep: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.target_sparsity = _in_range(self.target_sparsity, "skip_softmax.target_sparsity", 0.0, 1.0)
+        self.threshold = _in_range(self.threshold, "skip_softmax.threshold", 0.0, None)
+        self.disabled_until_timestep = (
+            _in_range(self.disabled_until_timestep, "skip_softmax.disabled_until_timestep", 0.0, 1.0) or 0.0
+        )
+        if self.target_sparsity is not None and self.threshold is not None:
+            raise ValueError("skip_softmax: set either target_sparsity or threshold, not both.")
+
+
 @dataclass
 class AttentionSpec:
-    """Specifies a backend and its backend-specific parameters for one attention role."""
+    """Specifies a backend and its typed backend-specific config for one attention role."""
 
-    backend: str  # registry name, e.g. "FLASH_ATTN"
-    extra: dict[str, Any] = field(default_factory=dict)  # backend-specific kwargs
+    backend: str
+    skip_softmax: SkipSoftmaxSpec | None = None
+    skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str):
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
+        self.skip_softmax = self._coerce_skip_softmax(self.skip_softmax)
+        if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
+            raise ValueError(
+                f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
+                f"Remove skip_softmax or set backend to TRTLLM_ATTN."
+            )
 
-        if self.extra is None:
-            self.extra = {}
-        elif isinstance(self.extra, Mapping):
-            self.extra = dict(self.extra)
-        else:
-            raise TypeError(f"Expected dict for AttentionSpec.extra, got {type(self.extra)!r}")
+    @staticmethod
+    def _coerce_skip_softmax(value: Any) -> SkipSoftmaxSpec | None:
+        if value is None or isinstance(value, SkipSoftmaxSpec):
+            return value
+        if isinstance(value, Mapping):
+            return SkipSoftmaxSpec(**dict(value))
+        raise TypeError(f"Expected dict or SkipSoftmaxSpec for skip_softmax, got {type(value)!r}")
+
+    def backend_kwargs(self) -> dict[str, Any] | None:
+        """Serialize typed backend config into the kwargs dict the backend impl consumes."""
+        if self.skip_softmax is None:
+            return None
+        ss = self.skip_softmax
+        kw: dict[str, Any] = {}
+        if ss.threshold is not None:
+            kw["skip_softmax_threshold"] = ss.threshold
+        if ss.target_sparsity is not None:
+            kw["target_sparsity"] = ss.target_sparsity
+        if ss.disabled_until_timestep:
+            kw["disabled_until_timestep"] = ss.disabled_until_timestep
+        return kw or None
 
 
 @dataclass
@@ -1408,13 +1506,13 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {"backend", "extra"}
+        spec_keys = {"backend", "skip_softmax"}
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:
             if not node_keys <= spec_keys:
                 raise ValueError(
-                    f"Invalid per_role entry for role {role!r}: cannot mix backend/extra with nested role keys."
+                    f"Invalid per_role entry for role {role!r}: cannot mix backend/skip_softmax with nested role keys."
                 )
             normalized[role] = node_dict
             return
