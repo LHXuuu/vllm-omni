@@ -1712,8 +1712,7 @@ async def realtime_websocket(websocket: WebSocket):
     duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
     duplex_query = websocket.query_params.get("duplex")
     use_duplex_realtime = duplex_handler is not None and (
-        duplex_query is None
-        or (isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"})
+        duplex_query is None or (isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"})
     )
     if use_duplex_realtime and duplex_handler is not None:
         await duplex_handler.handle_realtime_session(websocket)
