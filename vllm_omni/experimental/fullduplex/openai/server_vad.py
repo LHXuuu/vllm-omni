@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 import numpy as np
+from vllm.transformers_utils.repo_utils import try_get_local_file
 
 SILERO_VAD_REPO_ID = "istupakov/silero-vad-onnx"
 SILERO_VAD_REVISION = "8b14476858ef240c50b3884bb38cc67290c1cc70"
@@ -520,17 +521,13 @@ class SileroVADBackendProvider:
             if path.is_file():
                 return path
             raise RuntimeError(f"Configured Silero VAD model does not exist: {path}")
-        try:
-            from huggingface_hub import try_to_load_from_cache
-        except ImportError as exc:  # pragma: no cover - required by normal serving installs.
-            raise RuntimeError("huggingface_hub is required to resolve the cached Silero VAD artifact") from exc
-        cached = try_to_load_from_cache(
-            repo_id=self.repo_id,
-            filename=self.filename,
+        cached = try_get_local_file(
+            model=self.repo_id,
+            file_name=self.filename,
             revision=self.revision,
         )
-        if isinstance(cached, str) and Path(cached).is_file():
-            return Path(cached)
+        if isinstance(cached, Path) and cached.is_file():
+            return cached
         raise RuntimeError(
             "Silero VAD artifact is not available locally. Pre-download the pinned artifact "
             "or configure duplex_session.server_vad_model_path."

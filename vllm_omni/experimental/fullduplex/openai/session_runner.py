@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import binascii
 import json
 import uuid
@@ -9,6 +8,7 @@ from contextlib import suppress
 from copy import deepcopy
 
 import numpy as np
+import pybase64 as base64
 from fastapi import WebSocket, WebSocketDisconnect
 from vllm.logger import init_logger
 
