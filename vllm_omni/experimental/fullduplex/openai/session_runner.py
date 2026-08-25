@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import uuid
 from contextlib import suppress
 from copy import deepcopy
 
+import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 from vllm.logger import init_logger
 
@@ -25,6 +28,10 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
 )
 from vllm_omni.experimental.fullduplex.openai.realtime_session import (
     NativeRealtimeSessionProtocol,
+)
+from vllm_omni.experimental.fullduplex.openai.realtime_trace import (
+    trace_realtime_action,
+    trace_realtime_event,
 )
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     PcmAppendReservation,
@@ -74,6 +81,12 @@ class DuplexSessionRunnerMixin:
             nonlocal resume_credential_delivered
             try:
                 await websocket.send_json(payload)
+                trace_realtime_event(
+                    "websocket",
+                    "server_event",
+                    payload,
+                    session_id=session.session_id if session is not None else None,
+                )
             except RuntimeError as exc:
                 message = str(exc)
                 if "after sending 'websocket.close'" in message or "response already completed" in message:
@@ -133,7 +146,7 @@ class DuplexSessionRunnerMixin:
                 await actor.send_json(raw_payload)
 
             realtime_protocol.bind_sender(send_realtime_raw)
-        native: ServingRuntimeSessionState = self._serving_runtime_adapter.create_session_state()
+        native: ServingRuntimeSessionState = self._create_runtime_session_state()
 
         def begin_close(reason: str) -> None:
             actor.closing = True
@@ -171,6 +184,12 @@ class DuplexSessionRunnerMixin:
                 )
                 if not accepted:
                     return
+                trace_realtime_event(
+                    "session_runner",
+                    "domain_event",
+                    payload,
+                    session_id=session.session_id if session is not None else None,
+                )
                 await send_outbound(payload)
                 if deferred_overlap_payload is not None:
                     deferred_precreate_response = native.deferred_precreate_response
@@ -228,6 +247,31 @@ class DuplexSessionRunnerMixin:
                             {"type": "error", "error": "Duplex event missing string type", "code": "bad_event"}
                         )
                         continue
+                    trace_realtime_event(
+                        "protocol",
+                        "translated_event",
+                        event,
+                        session_id=session.session_id,
+                    )
+                    session_update_ack: asyncio.Future[None] | None = None
+                    if (
+                        realtime_protocol is not None
+                        and event_type == "turn.signal"
+                        and event.get("event") == "session.update"
+                    ):
+                        session_update_ack = asyncio.get_running_loop().create_future()
+                        event["_duplex_session_update_ack"] = session_update_ack
+                    server_vad_append_ack: asyncio.Future[None] | None = None
+                    if (
+                        realtime_protocol is not None
+                        and event_type == "input_audio_buffer.append"
+                        and session.config.server_vad is not None
+                        and not self._uses_native_input_append(session)
+                        and isinstance(event.get("audio"), str)
+                        and bool(event.get("audio"))
+                    ):
+                        server_vad_append_ack = asyncio.get_running_loop().create_future()
+                        event["_duplex_server_vad_append_ack"] = server_vad_append_ack
                     if event_type in {"input.commit", "input_audio_buffer.commit"}:
                         if not session.reserve_pending_turn(
                             limit=self._duplex_session_config.max_pending_turns_per_session
@@ -245,6 +289,10 @@ class DuplexSessionRunnerMixin:
                     if is_input_event(event_type) and native_response_in_progress():
                         event["_duplex_overlap_candidate"] = True
                     await actor.enqueue_event(event)
+                    if session_update_ack is not None:
+                        await session_update_ack
+                    if server_vad_append_ack is not None:
+                        await server_vad_append_ack
             except WebSocketDisconnect:
                 await actor.enqueue_event({"type": "__disconnect__"})
 
@@ -282,6 +330,142 @@ class DuplexSessionRunnerMixin:
             if actor.has_response_bound_append_tasks():
                 return True
             return False
+
+        def chat_response_in_progress() -> bool:
+            # The actor retains response ownership until its terminal event is
+            # consumed, even if the task has just completed. This prevents a
+            # queued audio event from overtaking pending-turn activation.
+            return actor.active_response_task is not None
+
+        def start_chat_response() -> None:
+            assert session is not None
+            trace_realtime_action(
+                "session_runner",
+                "chat_response_scheduled",
+                session_id=session.session_id,
+                epoch=session.epoch,
+                committed_turns=session.input_commit_seq,
+                history_messages=len(session.history),
+            )
+
+            async def run_and_notify() -> None:
+                task = asyncio.current_task()
+                try:
+                    await self._run_response(session, emit_event)
+                finally:
+                    await actor.enqueue_event(
+                        {
+                            "type": "__chat_response_finished__",
+                            "_response_task": task,
+                        }
+                    )
+
+            actor.active_response_task = asyncio.create_task(run_and_notify())
+
+        def activate_waiting_server_vad_turn() -> None:
+            assert session is not None
+            pending_turn = session.activate_server_vad_turn()
+            if pending_turn is not None and pending_turn.create_response:
+                start_chat_response()
+
+        def resolve_session_update_ack(event: dict[str, object]) -> None:
+            ack = event.pop("_duplex_session_update_ack", None)
+            if isinstance(ack, asyncio.Future) and not ack.done():
+                ack.set_result(None)
+
+        def resolve_server_vad_append_ack(
+            event: dict[str, object],
+            *,
+            accepted: bool,
+        ) -> None:
+            ack = event.pop("_duplex_server_vad_append_ack", None)
+            if not isinstance(ack, asyncio.Future):
+                return
+            if accepted:
+                if realtime_protocol is not None:
+                    realtime_protocol.lock_realtime_turn_detection_config()
+            if not ack.done():
+                ack.set_result(None)
+
+        def correlate_realtime_error(
+            payload: dict[str, object],
+            event_id: object,
+        ) -> dict[str, object]:
+            if isinstance(event_id, str) and event_id:
+                payload["event_id"] = event_id
+            return payload
+
+        async def commit_server_vad_turn(
+            *,
+            item_id: str,
+            create_response: bool,
+            retain_input_bytes: int,
+            event_id: object = None,
+        ) -> None:
+            assert session is not None
+            active_response = chat_response_in_progress()
+            trace_realtime_action(
+                "server_vad",
+                "turn_commit_requested",
+                session_id=session.session_id,
+                item_id=item_id,
+                create_response=create_response,
+                active_response=active_response,
+                pending_turn=session.pending_server_vad_turn is not None,
+            )
+            if active_response and session.pending_server_vad_turn is not None:
+                released = session.discard_uncommitted_server_vad_utterance()
+                session.release_input_bytes(released)
+                self._realtime_vad_metrics.error(
+                    session.config.model or self._chat_service.model_config.model,
+                    "pending_turn_backpressure",
+                )
+                await emit_event(
+                    correlate_realtime_error(
+                        {
+                            "type": "error",
+                            "session_id": session.session_id,
+                            "code": "input_backpressure",
+                            "error": "Only one committed Server VAD turn may wait for the active response",
+                        },
+                        event_id,
+                    )
+                )
+                return
+            if not session.stage_server_vad_audio_for_commit():
+                return
+            committed = session.commit_user_input(
+                append_history=not active_response,
+                retain_input_bytes=retain_input_bytes,
+            )
+            if committed is None:
+                return
+            if active_response:
+                session.stage_server_vad_turn(
+                    committed,
+                    create_response=create_response,
+                    item_id=item_id,
+                )
+            else:
+                session.register_history_item(item_id, committed.message)
+            trace_realtime_action(
+                "server_vad",
+                "turn_committed",
+                session_id=session.session_id,
+                item_id=item_id,
+                create_response=create_response,
+                queued=active_response,
+                history_messages=len(session.history),
+            )
+            await emit_event(
+                self._input_committed_payload(
+                    session,
+                    committed,
+                    item_id=item_id,
+                )
+            )
+            if create_response and not active_response:
+                start_chat_response()
 
         def clear_completed_pending_silence() -> None:
             task = native.pending_silence_task
@@ -643,7 +827,7 @@ class DuplexSessionRunnerMixin:
                 return
             session = handshake.session
             if handshake.resumed:
-                native = self._serving_runtime_adapter.session_states[session.session_id]
+                native = self._serving_session_states[session.session_id]
                 actor.tasks = self._session_tasks[session.session_id]
                 persisted_protocol = self._realtime_protocols.get(session.session_id)
                 if persisted_protocol is None:
@@ -657,7 +841,7 @@ class DuplexSessionRunnerMixin:
                 self._ensure_lifecycle_listener()
                 reader_task = asyncio.create_task(read_event_loop(), name="duplex-session-reader")
             else:
-                self._serving_runtime_adapter.session_states[session.session_id] = native
+                self._store_runtime_session_state(session.session_id, native)
                 self._session_tasks[session.session_id] = actor.tasks
                 if realtime_protocol is not None:
                     self._realtime_protocols[session.session_id] = realtime_protocol
@@ -669,6 +853,26 @@ class DuplexSessionRunnerMixin:
                 if open_result is False:
                     return
                 runtime_opened = True
+                try:
+                    await self._configure_server_vad(session)
+                except Exception as exc:
+                    logger.exception("Server VAD initialization failed: %s", exc)
+                    self._realtime_vad_metrics.error(
+                        session.config.model or self._chat_service.model_config.model,
+                        "initialization",
+                    )
+                    await emit_event(
+                        correlate_realtime_error(
+                            {
+                                "type": "error",
+                                "session_id": session.session_id,
+                                "code": "server_vad_initialization_failed",
+                                "error": str(exc),
+                            },
+                            handshake.event_id,
+                        )
+                    )
+                    return
                 created_attachment = await self._attachment_registry.create(
                     session.session_id,
                     incarnation=session.incarnation,
@@ -703,6 +907,14 @@ class DuplexSessionRunnerMixin:
 
                 if event_type == "__replaced_attachment__":
                     return
+
+                if event_type == "__chat_response_finished__":
+                    completed_task = event.get("_response_task")
+                    if completed_task is not actor.active_response_task:
+                        continue
+                    actor.active_response_task = None
+                    activate_waiting_server_vad_turn()
+                    continue
 
                 if event_type == "__timeout__":
                     begin_close("timeout")
@@ -854,6 +1066,9 @@ class DuplexSessionRunnerMixin:
                 if event_type == "input_audio_buffer.clear":
                     native.audio_buffer.clear()
                     session.release_all_input_bytes()
+                    server_vad_pipeline = self._server_vad_pipelines.get(session.session_id)
+                    if server_vad_pipeline is not None:
+                        server_vad_pipeline.reset()
                     native.input_since_commit = False
                     native.speech_since_commit = False
                     native.clear_committed_audio()
@@ -883,13 +1098,11 @@ class DuplexSessionRunnerMixin:
                         turn_id=session.turn_id,
                         incarnation=session.incarnation,
                     )
-                    if event_type == "response.cancel":
+                    if event_type in {"response.cancel", "output_audio_buffer.clear"}:
                         requested_response_id = event.get("response_id")
                         has_active_response_work = native_response_in_progress()
-                        if (
-                            isinstance(requested_response_id, str)
-                            and session.active_response_id is not None
-                            and requested_response_id != session.active_response_id
+                        if isinstance(requested_response_id, str) and (
+                            session.active_response_id is None or requested_response_id != session.active_response_id
                         ):
                             await emit_event(
                                 {
@@ -900,6 +1113,7 @@ class DuplexSessionRunnerMixin:
                                 }
                             )
                             continue
+                    if event_type == "response.cancel":
                         if not has_active_response_work:
                             if realtime_protocol is not None and isinstance(requested_response_id, str):
                                 continue
@@ -1008,6 +1222,7 @@ class DuplexSessionRunnerMixin:
                             }
                         )
                         actor.active_response_task = None
+                        activate_waiting_server_vad_turn()
                         continue
                     if not cancelled:
                         await self._cancel_pending_input(session, emit_event, reason="barge_in")
@@ -1029,6 +1244,8 @@ class DuplexSessionRunnerMixin:
                     ):
                         continue
                     actor.active_response_task = None
+                    if event_type in {"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"}:
+                        activate_waiting_server_vad_turn()
                     continue
 
                 if event_type == "turn.signal":
@@ -1039,6 +1256,7 @@ class DuplexSessionRunnerMixin:
                             continue
                         if turn_event == "session.update":
                             payload = event.get("payload")
+                            realtime_event_id = event.get("_realtime_event_id")
                             if not isinstance(payload, dict):
                                 await emit_event(
                                     {
@@ -1048,12 +1266,15 @@ class DuplexSessionRunnerMixin:
                                         "error": "session.update requires a session payload",
                                     }
                                 )
+                                resolve_session_update_ack(event)
                                 continue
                             if not await wait_for_native_append_tail():
+                                resolve_session_update_ack(event)
                                 continue
                             runtime_update_error = self._runtime_session_update_error(session, payload)
                             if runtime_update_error is not None:
-                                await emit_event(runtime_update_error)
+                                await emit_event(correlate_realtime_error(runtime_update_error, realtime_event_id))
+                                resolve_session_update_ack(event)
                                 continue
                             previous_config = session.config
                             candidate_config = deepcopy(previous_config)
@@ -1062,41 +1283,85 @@ class DuplexSessionRunnerMixin:
                                 update_error = self._apply_session_update(session, payload)
                             finally:
                                 session.replace_config(previous_config)
+                            server_vad_changed = candidate_config.server_vad != previous_config.server_vad
                             if update_error is not None:
-                                await emit_event(update_error)
+                                await emit_event(correlate_realtime_error(update_error, realtime_event_id))
+                                resolve_session_update_ack(event)
                                 continue
                             runtime_update_error = self._runtime_session_candidate_update_error(
                                 session,
                                 candidate_config,
                             )
                             if runtime_update_error is not None:
-                                await emit_event(runtime_update_error)
+                                await emit_event(correlate_realtime_error(runtime_update_error, realtime_event_id))
+                                resolve_session_update_ack(event)
                                 continue
                             candidate_runtime_config = self._runtime_config_for_session_update(
                                 session,
                                 candidate_config,
                             )
-                            if not await self._signal_runtime_session(
+                            candidate_server_vad_pipeline = None
+                            if server_vad_changed:
+                                try:
+                                    candidate_server_vad_pipeline = await self._prepare_server_vad_pipeline(
+                                        session,
+                                        candidate_config,
+                                    )
+                                except Exception as exc:
+                                    logger.exception("Server VAD session update failed: %s", exc)
+                                    self._realtime_vad_metrics.error(
+                                        candidate_config.model or self._chat_service.model_config.model,
+                                        "initialization",
+                                    )
+                                    await emit_event(
+                                        correlate_realtime_error(
+                                            {
+                                                "type": "error",
+                                                "session_id": session.session_id,
+                                                "code": "server_vad_initialization_failed",
+                                                "error": str(exc),
+                                            },
+                                            realtime_event_id,
+                                        )
+                                    )
+                                    resolve_session_update_ack(event)
+                                    continue
+                            runtime_updated = await self._signal_runtime_session(
                                 session,
                                 turn_event,
                                 emit_event,
                                 session_config=candidate_config.as_dict(),
                                 runtime_config=candidate_runtime_config,
-                            ):
+                            )
+                            if not runtime_updated:
+                                if candidate_server_vad_pipeline is not None:
+                                    candidate_server_vad_pipeline.reset()
+                                resolve_session_update_ack(event)
                                 continue
                             session.replace_config(candidate_config)
                             session.replace_runtime_config(candidate_runtime_config)
+                            if server_vad_changed:
+                                self._install_server_vad_pipeline(
+                                    session,
+                                    candidate_server_vad_pipeline,
+                                )
+                            if realtime_protocol is not None:
+                                realtime_protocol.commit_realtime_session_update(payload)
                             await emit_event(
                                 {
                                     "type": "session.updated",
                                     "session": session.as_public_dict(),
                                 }
                             )
+                            resolve_session_update_ack(event)
                             continue
                         if turn_event == "conversation.item.create":
                             payload = event.get("payload")
                             item = payload.get("item") if isinstance(payload, dict) else None
-                            message = self._realtime_item_to_history_message(item)
+                            history_item = payload.get("history_item") if isinstance(payload, dict) else None
+                            if not isinstance(history_item, dict):
+                                history_item = item
+                            message = self._realtime_item_to_history_message(history_item)
                             item_id = item.get("id") if isinstance(item, dict) else None
                             if message is not None:
                                 session.append_history_message(message)
@@ -1212,24 +1477,29 @@ class DuplexSessionRunnerMixin:
                     default_sample_rate_hz = 16000
                     sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
                     sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else default_sample_rate_hz
-                    try:
-                        audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
-                            audio,
-                            fmt,
-                            sample_rate_hz=sample_rate_hz,
-                        )
-                    except ValueError as exc:
-                        await emit_event({"type": "error", "error": str(exc), "code": "bad_event"})
-                        continue
-                    if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
-                        await emit_event(
-                            {
-                                "type": "error",
-                                "error": "input_audio_buffer.append pcm16 audio could not be decoded",
-                                "code": "bad_audio",
-                            }
-                        )
-                        continue
+                    server_vad_input = session.config.server_vad is not None and not self._uses_native_input_append(
+                        session
+                    )
+                    if not server_vad_input:
+                        try:
+                            audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
+                                audio,
+                                fmt,
+                                sample_rate_hz=sample_rate_hz,
+                            )
+                        except ValueError as exc:
+                            await emit_event({"type": "error", "error": str(exc), "code": "bad_event"})
+                            continue
+                        if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
+                            await emit_event(
+                                {
+                                    "type": "error",
+                                    "error": "input_audio_buffer.append pcm16 audio could not be decoded",
+                                    "code": "bad_audio",
+                                }
+                            )
+                            continue
+                        session.lock_turn_detection_config()
                     force_listen = bool(event.get("force_listen", False))
                     payload = {
                         "type": "audio",
@@ -1243,6 +1513,198 @@ class DuplexSessionRunnerMixin:
                         frames = [frame for frame in video_frames if isinstance(frame, str) and frame]
                         if frames:
                             payload["video_frames"] = frames
+                    if server_vad_input:
+                        realtime_event_id = event.get("_realtime_event_id")
+                        pipeline = self._server_vad_pipelines.get(session.session_id)
+                        if pipeline is None:
+                            await emit_event(
+                                correlate_realtime_error(
+                                    {
+                                        "type": "error",
+                                        "session_id": session.session_id,
+                                        "code": "internal_error",
+                                        "error": "server_vad is configured but its detector pipeline is unavailable",
+                                    },
+                                    realtime_event_id,
+                                )
+                            )
+                            resolve_server_vad_append_ack(event, accepted=False)
+                            continue
+                        try:
+                            if fmt != "pcm16":
+                                raise ValueError("server_vad input must be mono PCM16")
+                            source_sample_rate_hz = int(sample_rate_hz)
+                            if source_sample_rate_hz not in {16_000, 24_000}:
+                                raise ValueError("server_vad PCM16 input sample rate must be 16000 or 24000 Hz")
+                            if (
+                                pipeline.source_sample_rate_hz is not None
+                                and source_sample_rate_hz != pipeline.source_sample_rate_hz
+                            ):
+                                raise ValueError(
+                                    "server_vad input sample rate cannot change within a continuous audio stream"
+                                )
+                            raw_audio = base64.b64decode(audio, validate=True)
+                            if len(raw_audio) % np.dtype("<i2").itemsize:
+                                raise ValueError("server_vad PCM16 input contains an incomplete sample")
+                            source_samples = len(raw_audio) // np.dtype("<i2").itemsize
+                        except (binascii.Error, ValueError) as exc:
+                            await emit_event(
+                                correlate_realtime_error(
+                                    {
+                                        "type": "error",
+                                        "session_id": session.session_id,
+                                        "code": "bad_audio",
+                                        "error": str(exc),
+                                    },
+                                    realtime_event_id,
+                                )
+                            )
+                            resolve_server_vad_append_ack(event, accepted=False)
+                            continue
+                        previous_scratch_bytes = pipeline.scratch_bytes
+                        normalized_sample_upper_bound = (
+                            source_samples
+                            if source_sample_rate_hz == pipeline.sample_rate_hz
+                            else ((source_samples + 2) // 3) * 2
+                        )
+                        reserved_bytes = normalized_sample_upper_bound * np.dtype(np.float32).itemsize
+                        if not session.reserve_input_bytes(
+                            reserved_bytes,
+                            limit=self._duplex_session_config.max_pending_input_bytes_per_session,
+                        ):
+                            session.cancel_pending_input()
+                            pipeline.reset()
+                            self._realtime_vad_metrics.error(
+                                session.config.model or self._chat_service.model_config.model,
+                                "input_backpressure",
+                            )
+                            await emit_event(
+                                correlate_realtime_error(
+                                    {
+                                        "type": "error",
+                                        "session_id": session.session_id,
+                                        "code": "input_backpressure",
+                                        "error": "Server VAD input exceeds the per-session input limit",
+                                    },
+                                    realtime_event_id,
+                                )
+                            )
+                            await emit_event(
+                                {
+                                    "type": "input_audio_buffer.cleared",
+                                    "session_id": session.session_id,
+                                }
+                            )
+                            if realtime_protocol is not None:
+                                realtime_protocol.clear_realtime_input_buffer_state()
+                            resolve_server_vad_append_ack(event, accepted=False)
+                            continue
+                        try:
+                            vad_batch = await pipeline.push_pcm16(
+                                raw_audio,
+                                source_sample_rate_hz=source_sample_rate_hz,
+                            )
+                        except Exception as exc:
+                            session.cancel_pending_input()
+                            pipeline.reset()
+                            logger.exception("Server VAD inference failed: %s", exc)
+                            self._realtime_vad_metrics.error(
+                                session.config.model or self._chat_service.model_config.model,
+                                "inference",
+                            )
+                            await emit_event(
+                                correlate_realtime_error(
+                                    {
+                                        "type": "error",
+                                        "session_id": session.session_id,
+                                        "code": "server_vad_inference_failed",
+                                        "error": str(exc),
+                                    },
+                                    realtime_event_id,
+                                )
+                            )
+                            await emit_event(
+                                {
+                                    "type": "input_audio_buffer.cleared",
+                                    "session_id": session.session_id,
+                                }
+                            )
+                            if realtime_protocol is not None:
+                                realtime_protocol.clear_realtime_input_buffer_state()
+                            resolve_server_vad_append_ack(event, accepted=False)
+                            continue
+                        retained_delta = (
+                            sum(frame.samples.nbytes for frame in vad_batch.frames)
+                            + pipeline.scratch_bytes
+                            - previous_scratch_bytes
+                        )
+                        session.release_input_bytes(max(0, reserved_bytes - retained_delta))
+                        trace_realtime_action(
+                            "server_vad",
+                            "batch_processed",
+                            session_id=session.session_id,
+                            input_samples=source_samples,
+                            input_sample_rate_hz=source_sample_rate_hz,
+                            frames=len(vad_batch.frames),
+                            inference_ms=round(vad_batch.inference_ms, 3),
+                            scratch_bytes=pipeline.scratch_bytes,
+                            speech_active=pipeline.speech_active,
+                        )
+                        self._realtime_vad_metrics.observe_inference(
+                            session.config.model or self._chat_service.model_config.model,
+                            vad_batch.inference_ms,
+                        )
+                        prefix_samples = round(
+                            session.config.server_vad.prefix_padding_ms * pipeline.sample_rate_hz / 1000
+                        )
+                        for frame_index, vad_frame in enumerate(vad_batch.frames):
+                            released_bytes = session.append_server_vad_frame(
+                                vad_frame.samples,
+                                speech_started=vad_frame.decision.speech_started,
+                                speech_stopped=vad_frame.decision.speech_stopped,
+                                prefix_samples=prefix_samples,
+                            )
+                            session.release_input_bytes(released_bytes)
+                            if vad_frame.decision.speech_started:
+                                item_id = f"item_{uuid.uuid4().hex}"
+                                session.begin_server_vad_speech(item_id)
+                                await emit_event(
+                                    {
+                                        "type": "input_audio_buffer.speech_started",
+                                        "session_id": session.session_id,
+                                        "item_id": item_id,
+                                        "audio_start_ms": vad_frame.decision.audio_start_ms or 0,
+                                    }
+                                )
+                            if vad_frame.decision.speech_stopped:
+                                item_id = session.finish_server_vad_speech() or f"item_{uuid.uuid4().hex}"
+                                await emit_event(
+                                    {
+                                        "type": "input_audio_buffer.speech_stopped",
+                                        "session_id": session.session_id,
+                                        "item_id": item_id,
+                                        "audio_end_ms": vad_frame.decision.audio_end_ms or 0,
+                                    }
+                                )
+                                if vad_frame.decision.endpoint_delay_ms is not None:
+                                    self._realtime_vad_metrics.observe_endpoint_delay(
+                                        session.config.model or self._chat_service.model_config.model,
+                                        vad_frame.decision.endpoint_delay_ms,
+                                    )
+                                remaining_frame_bytes = sum(
+                                    frame.samples.nbytes for frame in vad_batch.frames[frame_index + 1 :]
+                                )
+                                await commit_server_vad_turn(
+                                    item_id=item_id,
+                                    create_response=session.config.server_vad.create_response,
+                                    retain_input_bytes=remaining_frame_bytes + pipeline.scratch_bytes,
+                                    event_id=realtime_event_id,
+                                )
+                        accepted_audio = source_samples > 0
+                        if accepted_audio:
+                            session.lock_turn_detection_config()
+                        resolve_server_vad_append_ack(event, accepted=accepted_audio)
+                        continue
                     # Speech/silence tag for the Stage0 turn-ended latch.
                     payload["is_speech"] = self._input_looks_like_speech(event, payload, session=session)
                     defer_native_append = False
@@ -1435,11 +1897,23 @@ class DuplexSessionRunnerMixin:
                     continue
 
                 if event_type in {"input.commit", "input_audio_buffer.commit", "response.create"}:
-                    realtime_item_id = event.get("realtime_item_id")
+                    if (
+                        event_type == "response.create"
+                        and session.config.server_vad is not None
+                        and chat_response_in_progress()
+                    ):
+                        await emit_event(
+                            {
+                                "type": "error",
+                                "session_id": session.session_id,
+                                "code": "response_already_active",
+                                "error": "response.create must wait for the active response to complete",
+                            }
+                        )
+                        continue
+                    item_id = event.get("item_id")
                     realtime_validated_audio_commit = (
-                        event_type == "input_audio_buffer.commit"
-                        and isinstance(realtime_item_id, str)
-                        and bool(realtime_item_id)
+                        event_type == "input_audio_buffer.commit" and isinstance(item_id, str) and bool(item_id)
                     )
                     if (
                         self._uses_native_input_append(session)
@@ -1587,13 +2061,13 @@ class DuplexSessionRunnerMixin:
                                 native.speech_since_commit = False
                                 committed = self._commit_native_audio_input(
                                     session,
-                                    realtime_item_id=event.get("realtime_item_id"),
+                                    item_id=event.get("item_id"),
                                     transcript=event.get("transcript"),
                                 )
                                 committed_payload = self._native_audio_committed_payload(
                                     session,
                                     committed=committed,
-                                    realtime_item_id=event.get("realtime_item_id"),
+                                    item_id=event.get("item_id"),
                                     transcript=event.get("transcript"),
                                 )
                                 committed_payload["overlap_deferred"] = True
@@ -1628,7 +2102,7 @@ class DuplexSessionRunnerMixin:
                             data_plane_turn_id = session.turn_id
                             committed = self._commit_native_audio_input(
                                 session,
-                                realtime_item_id=event.get("realtime_item_id"),
+                                item_id=event.get("item_id"),
                                 transcript=event.get("transcript"),
                                 turn_id=data_plane_turn_id,
                             )
@@ -1636,7 +2110,7 @@ class DuplexSessionRunnerMixin:
                                 self._native_audio_committed_payload(
                                     session,
                                     committed=committed,
-                                    realtime_item_id=event.get("realtime_item_id"),
+                                    item_id=event.get("item_id"),
                                     transcript=event.get("transcript"),
                                 )
                             )
@@ -1734,14 +2208,14 @@ class DuplexSessionRunnerMixin:
                             native.input_since_commit = False
                             committed = self._commit_native_audio_input(
                                 session,
-                                realtime_item_id=event.get("realtime_item_id"),
+                                item_id=event.get("item_id"),
                                 transcript=event.get("transcript"),
                             )
                             await emit_event(
                                 self._native_audio_committed_payload(
                                     session,
                                     committed=committed,
-                                    realtime_item_id=event.get("realtime_item_id"),
+                                    item_id=event.get("item_id"),
                                     transcript=event.get("transcript"),
                                 )
                             )
@@ -1800,7 +2274,7 @@ class DuplexSessionRunnerMixin:
                             committed = (
                                 self._commit_native_audio_input(
                                     session,
-                                    realtime_item_id=event.get("realtime_item_id"),
+                                    item_id=event.get("item_id"),
                                     transcript=event.get("transcript"),
                                 )
                                 if native_had_uncommitted_audio
@@ -1810,7 +2284,7 @@ class DuplexSessionRunnerMixin:
                                 self._native_audio_committed_payload(
                                     session,
                                     committed=committed,
-                                    realtime_item_id=event.get("realtime_item_id"),
+                                    item_id=event.get("item_id"),
                                     transcript=event.get("transcript"),
                                 )
                             )
@@ -1824,14 +2298,14 @@ class DuplexSessionRunnerMixin:
                             )
                         continue
                     if committed is not None:
-                        realtime_item_id = event.get("realtime_item_id")
-                        if isinstance(realtime_item_id, str):
-                            session.register_history_item(realtime_item_id, committed.message)
+                        item_id = event.get("item_id")
+                        if isinstance(item_id, str):
+                            session.register_history_item(item_id, committed.message)
                         await emit_event(
                             self._input_committed_payload(
                                 session,
                                 committed,
-                                realtime_item_id=realtime_item_id,
+                                item_id=item_id,
                             )
                         )
                     if not should_create_response:
@@ -1843,7 +2317,7 @@ class DuplexSessionRunnerMixin:
                             emit_event,
                             reason="new_response",
                         )
-                    actor.active_response_task = asyncio.create_task(self._run_response(session, emit_event))
+                    start_chat_response()
                     continue
 
                 await emit_event(
@@ -1915,6 +2389,12 @@ class DuplexSessionRunnerMixin:
                                 ),
                                 activity=DuplexLeaseActivity.DETACH,
                             )
+                    trace_realtime_action(
+                        "session_runner",
+                        "session_detached",
+                        session_id=session.session_id,
+                        stale_output_dropped=actor.stale_output_dropped,
+                    )
                 else:
                     begin_close(actor.close_reason or "disconnect")
                     await actor.cancel_append_tasks()
@@ -1937,6 +2417,13 @@ class DuplexSessionRunnerMixin:
                     with suppress(Exception):
                         await self._attachment_registry.close(session.session_id)
                     self._stop_lifecycle_listener_if_idle()
+                    trace_realtime_action(
+                        "session_runner",
+                        "session_closed",
+                        session_id=session.session_id,
+                        reason=actor.close_reason or "disconnect",
+                        stale_output_dropped=actor.stale_output_dropped,
+                    )
             await actor.close_writer()
             with suppress(Exception):
                 await asyncio.wait_for(actor.output_queue.join(), timeout=2.0)

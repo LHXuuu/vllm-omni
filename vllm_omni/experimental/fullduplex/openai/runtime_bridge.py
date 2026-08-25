@@ -21,6 +21,9 @@ from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     coerce_int,
     payload_turn_id,
 )
+from vllm_omni.experimental.fullduplex.openai.websocket import (
+    cancel_tasks_with_hard_timeout,
+)
 
 logger = init_logger(__name__)
 
@@ -36,6 +39,11 @@ class NativeRuntimeBridgeMixin:
     }
 
     async def _open_runtime_session(self, session: DuplexSession, send_json) -> dict[str, object] | bool:
+        # Turn-based sessions use the chat-fallback path and do not own a
+        # model-native duplex runtime.  Do not send control messages merely
+        # because the shared engine client exposes the duplex RPC methods.
+        if self._serving_runtime_adapter is None:
+            return True
         contract_error = self._native_runtime_contract_error(session)
         if contract_error is not None:
             await send_json(
@@ -243,11 +251,7 @@ class NativeRuntimeBridgeMixin:
                 # decision that lands in the swap window.
                 native.data_plane_restart_requested = True
                 return False
-            old_task.cancel()
-            try:
-                await asyncio.wait_for(asyncio.gather(old_task, return_exceptions=True), timeout=0.25)
-            except asyncio.TimeoutError:
-                pass
+            await cancel_tasks_with_hard_timeout((old_task,), timeout_s=0.25)
 
         async def _run() -> None:
             close_reason: str | None = None
@@ -434,13 +438,9 @@ class NativeRuntimeBridgeMixin:
         native.data_plane_restart_requested = False
         if task is None or task.done():
             return False
-        task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=0.25)
-        except asyncio.TimeoutError:
-            # Keep barge-in/cancel responsive. The task still carries the old
-            # expected_epoch and late model output is filtered by the writer.
-            pass
+        await cancel_tasks_with_hard_timeout((task,), timeout_s=0.25)
+        # The task still carries the old expected_epoch and late model output
+        # is filtered by the writer if it does not stop before the deadline.
         return True
 
     async def _signal_runtime_session(
@@ -454,6 +454,8 @@ class NativeRuntimeBridgeMixin:
         session_config: dict[str, object] | None = None,
         runtime_config: dict[str, object] | None = None,
     ) -> bool:
+        if self._serving_runtime_adapter is None:
+            return True
         signal_turn = getattr(self._chat_service.engine_client, "signal_duplex_turn_async", None)
         if not callable(signal_turn):
             return True
@@ -501,6 +503,8 @@ class NativeRuntimeBridgeMixin:
         return True
 
     async def _close_runtime_session(self, session: DuplexSession, *, reason: str, send_json=None) -> bool:
+        if self._serving_runtime_adapter is None:
+            return True
         close_session = getattr(self._chat_service.engine_client, "close_duplex_session_async", None)
         if not callable(close_session):
             return True
@@ -1188,11 +1192,21 @@ class NativeRuntimeBridgeMixin:
 
     def _cleanup_duplex_session_state(self, session: DuplexSession) -> None:
         session_id = session.session_id
-        self._serving_runtime_adapter.remove_session_state(session_id)
-        self._serving_runtime_adapter.data_plane.close_session(
-            session_id,
-            active_request_id=session.active_request_id,
-        )
+        pipeline = self._server_vad_pipelines.pop(session_id, None)
+        if pipeline is not None:
+            pipeline.reset()
+        model_name = self._server_vad_metric_models.pop(session_id, None)
+        if model_name is not None:
+            self._realtime_vad_metrics.session_finished(model_name)
+        adapter = self._serving_runtime_adapter
+        if adapter is None:
+            self._serving_session_states.pop(session_id, None)
+        else:
+            adapter.remove_session_state(session_id)
+            adapter.data_plane.close_session(
+                session_id,
+                active_request_id=session.active_request_id,
+            )
 
     def _encode_native_data_plane_audio(
         self,

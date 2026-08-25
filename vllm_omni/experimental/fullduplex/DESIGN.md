@@ -511,9 +511,10 @@ MiniCPM-specific bridge-state key.
 The stable API server inspects the deployment `session_mode` before importing or
 constructing the experimental duplex handler. Ordinary deployments do not load
 the full-duplex serving package or create its registries and background state.
-For an enabled deployment, the client still selects the Realtime duplex route
-with `?duplex=1` (or an equivalent explicit true value). Model-name matching is
-not used for routing or native-runtime activation. MiniCPM clients explicitly
+For an enabled deployment, bare `/v1/realtime` selects the Realtime duplex
+stack. `?duplex=1` remains a compatibility alias, while an explicit false value
+selects the legacy handler. Model-name matching is not used for routing or
+native-runtime activation. MiniCPM clients explicitly
 set `extra_body.minicpmo45_native_duplex=true`; repository demos do so in their
 session payloads.
 
@@ -547,7 +548,8 @@ own response IDs, playback, overlap, Realtime events, or model policy.
 
 ### Normative Realtime event contract
 
-The public contract in this section applies to `/v1/realtime?duplex=1`. Internal
+The public contract in this section applies to `/v1/realtime`; `?duplex=1`
+remains an equivalent compatibility alias. Internal
 duplex event names such as `response.output_audio.delta` are projection inputs,
 not additional public aliases. Events for one attachment preserve mailbox
 order; replay after resume preserves the original event order and `event_id`.
@@ -615,7 +617,7 @@ EOS decisions advance the model conversation.
 
 Explicit Realtime clients may still use `input_audio_buffer.commit` to create a
 conversation item. The translator validates that wire input before producing a
-commit carrying `realtime_item_id`. Native auto-response may already have
+commit carrying `item_id`. Native auto-response may already have
 streamed those PCM samples into the runtime, so the runner accepts a validated
 commit even when no runtime-side chunk remains. A truly empty explicit buffer
 continues to return `input_audio_buffer_empty`.

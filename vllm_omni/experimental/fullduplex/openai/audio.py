@@ -116,6 +116,24 @@ def wav_payload_to_pcm16(raw: bytes) -> tuple[bytes | None, int | None]:
         return None, None
 
 
+def encode_float32_mono_wav_base64(
+    samples: np.ndarray,
+    *,
+    sample_rate_hz: int,
+) -> str:
+    """Package normalized mono float32 samples as a PCM16 WAV data payload."""
+    rate = validate_input_sample_rate_hz(sample_rate_hz)
+    normalized = np.ascontiguousarray(samples, dtype=np.float32).reshape(-1)
+    pcm16 = np.clip(np.rint(normalized * 32768.0), -32768, 32767).astype("<i2")
+    with io.BytesIO() as buffer:
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(rate)
+            wav_file.writeframes(pcm16.tobytes())
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
 def convert_input_audio_with_rate(
     audio: object,
     fmt: object,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -10,6 +11,9 @@ from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSession
+from vllm_omni.experimental.fullduplex.openai.realtime_trace import (
+    trace_realtime_action,
+)
 
 logger = init_logger(__name__)
 
@@ -18,10 +22,22 @@ class ChatFallbackProjectorMixin:
     """Project generic chat completion output into duplex response events."""
 
     async def _run_response(self, session: DuplexSession, send_json) -> None:
+        started_at = time.perf_counter()
         response_id = session.begin_response()
         epoch = session.epoch
         request_id = f"duplex-{session.session_id}-{epoch}-{session.input_commit_seq}"
         session.bind_request(f"chatcmpl-{request_id}")
+        bound_request_id = session.active_request_id
+        trace_realtime_action(
+            "chat_fallback",
+            "response_started",
+            session_id=session.session_id,
+            response_id=response_id,
+            request_id=bound_request_id,
+            epoch=epoch,
+            history_messages=len(session.history),
+            modalities=session.response_config.modalities,
+        )
         await send_json(
             self._response_created_payload(
                 session,
@@ -35,8 +51,27 @@ class ChatFallbackProjectorMixin:
             request = self._build_chat_request(session, request_id)
             result = await self._chat_service.create_chat_completion(request, raw_request=None)
             if isinstance(result, ErrorResponse):
-                await send_json({"type": "error", "error": result.message, "code": result.type or "chat_error"})
+                error_info = getattr(result, "error", None)
+                error_message = (
+                    getattr(error_info, "message", None) or getattr(result, "message", None) or "Chat request failed"
+                )
+                error_code = (
+                    getattr(error_info, "code", None)
+                    or getattr(error_info, "type", None)
+                    or getattr(result, "type", None)
+                    or "chat_error"
+                )
+                await send_json({"type": "error", "error": error_message, "code": error_code})
                 session.end_response(commit_text=False)
+                trace_realtime_action(
+                    "chat_fallback",
+                    "response_failed",
+                    session_id=session.session_id,
+                    response_id=response_id,
+                    request_id=bound_request_id,
+                    code=error_code,
+                    elapsed_ms=round((time.perf_counter() - started_at) * 1000, 3),
+                )
                 return
             if hasattr(result, "__aiter__"):
                 await self._drain_streaming_response(session, result, epoch, response_id, send_json)
@@ -57,7 +92,25 @@ class ChatFallbackProjectorMixin:
                         "playback": session.playback.as_dict(),
                     }
                 )
+                trace_realtime_action(
+                    "chat_fallback",
+                    "response_completed",
+                    session_id=session.session_id,
+                    response_id=response_id,
+                    request_id=bound_request_id,
+                    epoch=epoch,
+                    committed=committed_message is not None,
+                    elapsed_ms=round((time.perf_counter() - started_at) * 1000, 3),
+                )
         except asyncio.CancelledError:
+            trace_realtime_action(
+                "chat_fallback",
+                "response_cancelled",
+                session_id=session.session_id,
+                response_id=response_id,
+                request_id=bound_request_id,
+                elapsed_ms=round((time.perf_counter() - started_at) * 1000, 3),
+            )
             raise
         except Exception as exc:
             logger.exception("Duplex response failed: %s", exc)
@@ -70,6 +123,15 @@ class ChatFallbackProjectorMixin:
                     "error": str(exc),
                     "code": "response_error",
                 }
+            )
+            trace_realtime_action(
+                "chat_fallback",
+                "response_failed",
+                session_id=session.session_id,
+                response_id=response_id,
+                request_id=bound_request_id,
+                code="response_error",
+                elapsed_ms=round((time.perf_counter() - started_at) * 1000, 3),
             )
 
     def _build_chat_request(self, session: DuplexSession, request_id: str) -> ChatCompletionRequest:
@@ -163,7 +225,7 @@ class ChatFallbackProjectorMixin:
             try:
                 parsed = json.loads(data)
             except json.JSONDecodeError:
-                logger.debug("Skipping non-JSON duplex stream payload: %s", data)
+                logger.debug("Skipping non-JSON duplex stream payload (chars=%d)", len(data))
                 continue
             if isinstance(parsed, dict):
                 payloads.append(parsed)

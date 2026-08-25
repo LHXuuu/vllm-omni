@@ -4,11 +4,17 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import WebSocketDisconnect
+
+from vllm_omni.experimental.fullduplex.openai.realtime_trace import (
+    trace_realtime_action,
+    trace_realtime_event,
+)
 
 INPUT_EVENTS = frozenset(
     {
@@ -79,6 +85,38 @@ DOMAIN_TERMINAL_EVENTS = frozenset(
     }
 )
 
+_RETAINED_CANCELLING_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _release_cancelled_task(task: asyncio.Task[Any]) -> None:
+    _RETAINED_CANCELLING_TASKS.discard(task)
+    with suppress(asyncio.CancelledError):
+        task.exception()
+
+
+async def cancel_tasks_with_hard_timeout(
+    tasks: Iterable[asyncio.Task[Any]],
+    *,
+    timeout_s: float,
+) -> set[asyncio.Task[Any]]:
+    """Request cancellation without waiting past ``timeout_s``.
+
+    ``asyncio.wait_for(gather(...))`` waits for the wrapped future to finish
+    cancelling after its timeout. A child that delays or suppresses
+    ``CancelledError`` can therefore block the caller indefinitely. Keep
+    unfinished tasks referenced for fencing and use ``asyncio.wait`` so the
+    timeout remains a hard upper bound.
+    """
+    active = {task for task in tasks if not task.done()}
+    if not active:
+        return set()
+    for task in active:
+        _RETAINED_CANCELLING_TASKS.add(task)
+        task.add_done_callback(_release_cancelled_task)
+        task.cancel()
+    _, pending = await asyncio.wait(active, timeout=max(0.0, timeout_s))
+    return pending
+
 
 def is_input_event(event_type: object) -> bool:
     return isinstance(event_type, str) and event_type in INPUT_EVENTS
@@ -121,12 +159,7 @@ class DuplexSessionTasks:
         ]
         if not tasks:
             return False
-        for task in tasks:
-            task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
-        except TimeoutError:
-            pass
+        await cancel_tasks_with_hard_timeout(tasks, timeout_s=timeout_s)
         return True
 
 
@@ -196,15 +229,24 @@ class DuplexWebSocketActor:
                 raw_realtime = payload.pop("_realtime_raw", False) is True
                 if not raw_realtime and self._is_stale_model_output(payload):
                     self.stale_output_dropped += 1
+                    trace_realtime_action(
+                        "websocket",
+                        "stale_output_dropped",
+                        event=payload.get("type"),
+                        epoch=payload.get("epoch"),
+                    )
                     continue
                 try:
                     if raw_realtime:
                         await self.websocket.send_json(payload)
+                        trace_realtime_event("websocket", "server_event", payload)
                     elif self.outbound_protocol is not None:
                         for projected in self.outbound_protocol.encode_outbound_event(payload):
                             await self.websocket.send_json(projected)
+                            trace_realtime_event("websocket", "server_event", projected)
                     else:
                         await self.websocket.send_json(payload)
+                        trace_realtime_event("websocket", "server_event", payload)
                 except (WebSocketDisconnect, RuntimeError):
                     return
             finally:
@@ -261,5 +303,6 @@ __all__ = [
     "DuplexAppendTaskMeta",
     "DuplexSessionTasks",
     "DuplexWebSocketActor",
+    "cancel_tasks_with_hard_timeout",
     "is_input_event",
 ]

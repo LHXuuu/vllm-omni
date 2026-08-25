@@ -40,12 +40,16 @@ REALTIME_ERROR_TYPES_BY_CODE = {
     "runtime_data_plane_text_without_audio": "server_error",
     "response_error": "server_error",
     "chat_error": "server_error",
+    "server_vad_initialization_failed": "server_error",
+    "server_vad_inference_failed": "server_error",
     "duplex_session_busy": "rate_limit_error",
     "resource_exhausted": "rate_limit_error",
+    "input_backpressure": "rate_limit_error",
     "response_already_active": "invalid_request_error",
     "response_not_active": "invalid_request_error",
     "response_create_without_input": "invalid_request_error",
     "input_audio_buffer_empty": "invalid_request_error",
+    "server_vad_manual_commit_unsupported": "invalid_request_error",
     "missing_item_id": "invalid_request_error",
     "item_not_found": "invalid_request_error",
     "unsupported_audio_format": "invalid_request_error",
@@ -120,6 +124,9 @@ class RealtimeSessionState:
     _input_audio_buffer_has_audio: bool = False
     _input_audio_buffer_had_non_speech: bool = False
     _input_audio_buffer_transcript_parts: list[str] = field(default_factory=list)
+    _turn_detection_configured: bool = False
+    _turn_detection: dict[str, object] | None = None
+    _turn_detection_config_locked: bool = False
 
     @classmethod
     def from_query_params(cls, query_params: Any) -> RealtimeSessionState:
@@ -195,3 +202,6 @@ class RealtimeStateOwner:
     _input_audio_buffer_has_audio: bool = _RealtimeStateField()
     _input_audio_buffer_had_non_speech: bool = _RealtimeStateField()
     _input_audio_buffer_transcript_parts: list[str] = _RealtimeStateField()
+    _turn_detection_configured: bool = _RealtimeStateField()
+    _turn_detection: dict[str, object] | None = _RealtimeStateField()
+    _turn_detection_config_locked: bool = _RealtimeStateField()

@@ -7,6 +7,26 @@ from enum import Enum
 from types import MappingProxyType
 from uuid import uuid4
 
+import numpy as np
+
+from vllm_omni.experimental.fullduplex.openai.audio import (
+    encode_float32_mono_wav_base64,
+)
+from vllm_omni.experimental.fullduplex.openai.server_vad import (
+    ServerVADConfig,
+)
+
+
+def _turn_detection_value(payload: Mapping[str, object]) -> tuple[bool, object]:
+    if "turn_detection" in payload:
+        return True, payload["turn_detection"]
+    audio = payload.get("audio")
+    if isinstance(audio, Mapping):
+        audio_input = audio.get("input")
+        if isinstance(audio_input, Mapping) and "turn_detection" in audio_input:
+            return True, audio_input["turn_detection"]
+    return False, None
+
 
 class DuplexOverlapPolicy(str, Enum):
     AUTO = "auto"
@@ -241,10 +261,12 @@ class DuplexSessionConfig:
     overlap_barge_in_ms: int = 1200
     overlap_silence_rms: float = 0.003
     playback_commit_policy: str = DuplexPlaybackCommitPolicy.COMMIT_ALL_ON_DONE.value
+    turn_detection_configured: bool = False
+    server_vad: ServerVADConfig | None = None
     extra_body: dict[str, object] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "model": self.model,
             "modalities": list(self.modalities),
             "instructions": self.instructions,
@@ -263,6 +285,9 @@ class DuplexSessionConfig:
             "playback_commit_policy": self.playback_commit_policy,
             "extra_body": dict(self.extra_body),
         }
+        if self.turn_detection_configured:
+            payload["turn_detection"] = self.server_vad.as_dict() if self.server_vad is not None else None
+        return payload
 
     @classmethod
     def from_event(cls, event: dict[str, object]) -> DuplexSessionConfig:
@@ -305,9 +330,13 @@ class DuplexSessionConfig:
             config.playback_commit_policy = cls._normalize_playback_commit_policy(source["playback_commit_policy"])
         if isinstance(source.get("modalities"), list) and all(isinstance(x, str) for x in source["modalities"]):
             config.modalities = list(source["modalities"])
+        turn_detection_configured, turn_detection = _turn_detection_value(source)
         if isinstance(source.get("extra_body"), dict):
             config.extra_body = dict(source["extra_body"])
             extra = config.extra_body
+            raw_realtime_session = extra.get("realtime_session_payload")
+            if not turn_detection_configured and isinstance(raw_realtime_session, dict):
+                turn_detection_configured, turn_detection = _turn_detection_value(raw_realtime_session)
             if isinstance(extra.get("overlap_policy"), str):
                 config.overlap_policy = cls._normalize_overlap_policy(extra["overlap_policy"])
             if isinstance(extra.get("overlap_short_ack_ms"), int | float):
@@ -318,6 +347,10 @@ class DuplexSessionConfig:
                 config.overlap_silence_rms = max(0.0, float(extra["overlap_silence_rms"]))
             if isinstance(extra.get("playback_commit_policy"), str):
                 config.playback_commit_policy = cls._normalize_playback_commit_policy(extra["playback_commit_policy"])
+        if turn_detection_configured:
+            config.turn_detection_configured = True
+            if turn_detection is not None:
+                config.server_vad = ServerVADConfig.from_value(turn_detection)
         return config
 
     @staticmethod
@@ -365,6 +398,13 @@ class DuplexCommittedInput:
 
 
 @dataclass
+class PendingServerVADTurn:
+    committed: DuplexCommittedInput
+    create_response: bool
+    item_id: str | None = None
+
+
+@dataclass
 class DuplexAssistantAudioTextMark:
     text_chars: int
     audio_end_ms: int
@@ -378,6 +418,13 @@ class InputBufferState:
     overlap_speech_ms: int = 0
     reserved_input_bytes: int = 0
     pending_turns: int = 0
+    turn_detection_config_locked: bool = False
+    vad_prefix_audio: list[np.ndarray] = field(default_factory=list)
+    vad_prefix_samples: int = 0
+    vad_utterance_audio: list[np.ndarray] = field(default_factory=list)
+    vad_speech_active: bool = False
+    active_server_vad_item_id: str | None = None
+    pending_server_vad_turn: PendingServerVADTurn | None = None
 
 
 @dataclass
@@ -579,6 +626,13 @@ class DuplexSession:
         self._input.reserved_input_bytes += size
         return True
 
+    @property
+    def turn_detection_config_locked(self) -> bool:
+        return self._input.turn_detection_config_locked
+
+    def lock_turn_detection_config(self) -> None:
+        self._input.turn_detection_config_locked = True
+
     def release_input_bytes(self, size: int) -> None:
         self._input.reserved_input_bytes = max(0, self._input.reserved_input_bytes - max(0, int(size)))
 
@@ -603,6 +657,91 @@ class DuplexSession:
         self._input.pending_audio.append(DuplexAudioChunk(data=data, format=fmt, sample_rate_hz=sample_rate_hz))
         self.turn_state = DuplexTurnState.USER_SPEAKING
 
+    def append_server_vad_frame(
+        self,
+        samples: np.ndarray,
+        *,
+        speech_started: bool,
+        speech_stopped: bool,
+        prefix_samples: int,
+    ) -> int:
+        """Store one detector frame while keeping commit-eligible audio session-owned.
+
+        Returns the number of raw float32 bytes released when the rolling
+        pre-speech prefix is trimmed.
+        """
+        frame = np.ascontiguousarray(samples, dtype=np.float32).reshape(-1)
+        released_samples = 0
+        if not self._input.vad_speech_active:
+            if speech_started:
+                self._input.vad_utterance_audio = [*self._input.vad_prefix_audio, frame]
+                self._input.vad_prefix_audio = []
+                self._input.vad_prefix_samples = 0
+                self._input.vad_speech_active = True
+            else:
+                self._input.vad_prefix_audio.append(frame)
+                self._input.vad_prefix_samples += frame.size
+                while self._input.vad_prefix_samples > prefix_samples and self._input.vad_prefix_audio:
+                    overflow = self._input.vad_prefix_samples - prefix_samples
+                    first = self._input.vad_prefix_audio[0]
+                    if first.size <= overflow:
+                        self._input.vad_prefix_audio.pop(0)
+                        self._input.vad_prefix_samples -= first.size
+                        released_samples += first.size
+                    else:
+                        self._input.vad_prefix_audio[0] = np.ascontiguousarray(first[overflow:], dtype=np.float32)
+                        self._input.vad_prefix_samples -= overflow
+                        released_samples += overflow
+        else:
+            self._input.vad_utterance_audio.append(frame)
+
+        if speech_stopped:
+            self._input.vad_speech_active = False
+        if self._input.vad_speech_active or speech_started:
+            self.turn_state = DuplexTurnState.USER_SPEAKING
+        return released_samples * np.dtype(np.float32).itemsize
+
+    def stage_server_vad_audio_for_commit(self) -> bool:
+        if not self._input.vad_utterance_audio:
+            return False
+        samples = np.concatenate(self._input.vad_utterance_audio)
+        encoded = encode_float32_mono_wav_base64(samples, sample_rate_hz=16_000)
+        self._input.pending_audio.append(DuplexAudioChunk(data=encoded, format="wav", sample_rate_hz=16_000))
+        self._input.vad_utterance_audio.clear()
+        self._input.vad_speech_active = False
+        return True
+
+    def clear_server_vad_audio(self) -> None:
+        self._input.vad_prefix_audio.clear()
+        self._input.vad_prefix_samples = 0
+        self._input.vad_utterance_audio.clear()
+        self._input.vad_speech_active = False
+        self._input.active_server_vad_item_id = None
+
+    @property
+    def active_server_vad_item_id(self) -> str | None:
+        return self._input.active_server_vad_item_id
+
+    @property
+    def server_vad_utterance_bytes(self) -> int:
+        return sum(frame.nbytes for frame in self._input.vad_utterance_audio)
+
+    def discard_uncommitted_server_vad_utterance(self) -> int:
+        released = self.server_vad_utterance_bytes
+        self._input.vad_utterance_audio.clear()
+        self._input.vad_speech_active = False
+        self._input.active_server_vad_item_id = None
+        self._input.pending_text.clear()
+        return released
+
+    def begin_server_vad_speech(self, item_id: str) -> None:
+        self._input.active_server_vad_item_id = item_id
+
+    def finish_server_vad_speech(self) -> str | None:
+        item_id = self._input.active_server_vad_item_id
+        self._input.active_server_vad_item_id = None
+        return item_id
+
     def mark_user_input_activity(self) -> None:
         self.turn_state = DuplexTurnState.USER_SPEAKING
 
@@ -618,10 +757,16 @@ class DuplexSession:
         self._input.pending_audio.clear()
         self._input.reserved_input_bytes = 0
         self._input.pending_turns = 0
+        self.clear_server_vad_audio()
         self.turn_state = DuplexTurnState.IDLE
         return cancelled
 
-    def commit_user_input(self) -> DuplexCommittedInput | None:
+    def commit_user_input(
+        self,
+        *,
+        append_history: bool = True,
+        retain_input_bytes: int = 0,
+    ) -> DuplexCommittedInput | None:
         text = "".join(self._input.pending_text).strip()
         audio_chunks = list(self._input.pending_audio)
         if not text and not audio_chunks:
@@ -647,10 +792,11 @@ class DuplexSession:
 
         self._input.commit_seq += 1
         message = {"role": "user", "content": content}
-        self._conversation.messages.append(message)
+        if append_history:
+            self._conversation.messages.append(message)
         self._input.pending_text.clear()
         self._input.pending_audio.clear()
-        self._input.reserved_input_bytes = 0
+        self._input.reserved_input_bytes = max(0, int(retain_input_bytes))
         self.turn_state = DuplexTurnState.USER_COMMITTED
         return DuplexCommittedInput(
             message=message,
@@ -658,6 +804,36 @@ class DuplexSession:
             epoch=self.epoch,
             input_commit_seq=self._input.commit_seq,
         )
+
+    @property
+    def pending_server_vad_turn(self) -> PendingServerVADTurn | None:
+        return self._input.pending_server_vad_turn
+
+    def stage_server_vad_turn(
+        self,
+        committed: DuplexCommittedInput,
+        *,
+        create_response: bool,
+        item_id: str | None,
+    ) -> None:
+        if self._input.pending_server_vad_turn is not None:
+            raise RuntimeError("A Server VAD turn is already pending")
+        self._input.pending_server_vad_turn = PendingServerVADTurn(
+            committed=committed,
+            create_response=create_response,
+            item_id=item_id,
+        )
+
+    def activate_server_vad_turn(self) -> PendingServerVADTurn | None:
+        pending = self._input.pending_server_vad_turn
+        if pending is None:
+            return None
+        self._input.pending_server_vad_turn = None
+        self._conversation.messages.append(pending.committed.message)
+        if pending.item_id:
+            self.register_history_item(pending.item_id, pending.committed.message)
+        self.turn_state = DuplexTurnState.USER_COMMITTED
+        return pending
 
     def commit_native_audio_input(
         self,
@@ -984,6 +1160,10 @@ class DuplexSession:
                 self._conversation.item_audio_text_marks[item_id] = list(marks)
 
     def delete_history_item(self, item_id: str) -> bool:
+        pending_server_vad_turn = self._input.pending_server_vad_turn
+        if pending_server_vad_turn is not None and pending_server_vad_turn.item_id == item_id:
+            self._input.pending_server_vad_turn = None
+            return True
         message = self._conversation.item_ids.pop(item_id, None)
         self._conversation.item_audio_text_marks.pop(item_id, None)
         pending = self._conversation.pending_item_ids.pop(item_id, None)
@@ -1206,6 +1386,8 @@ class DuplexSession:
         self.state = DuplexSessionState.CLOSED
         self.turn_state = DuplexTurnState.IDLE
         self._response.active_response_turn_id = None
+        self.clear_server_vad_audio()
+        self._input.pending_server_vad_turn = None
         self._clear_response_metrics()
         self._restore_response_config()
 
@@ -1236,6 +1418,8 @@ class DuplexSession:
             "playback": self.playback.as_dict(),
             "capabilities": self.capabilities.as_dict(),
         }
+        if self.config.turn_detection_configured:
+            payload["turn_detection"] = self.config.server_vad.as_dict() if self.config.server_vad is not None else None
         if isinstance(self.config.extra_body.get("realtime_tools"), list):
             payload["tools"] = self.config.extra_body["realtime_tools"]
         if isinstance(self.config.extra_body.get("realtime_tool_choice"), str | dict):

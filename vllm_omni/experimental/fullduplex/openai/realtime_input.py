@@ -10,15 +10,24 @@ import numpy as np
 
 from vllm_omni.experimental.fullduplex.openai.audio import (
     convert_input_audio_with_rate,
+    encode_float32_mono_wav_base64,
 )
 from vllm_omni.experimental.fullduplex.openai.realtime_state import (
     REALTIME_INPUT_AUDIO_FORMATS,
     REALTIME_OUTPUT_AUDIO_FORMATS,
 )
+from vllm_omni.experimental.fullduplex.openai.server_vad import ServerVADConfig
 
 
 class RealtimeInputTranslator:
     """Translate and validate client Realtime events for the duplex core."""
+
+    def _reset_realtime_input_buffer_state(self) -> None:
+        self._input_speech_started = False
+        self._active_input_item_id = None
+        self._input_audio_buffer_has_audio = False
+        self._input_audio_buffer_had_non_speech = False
+        self._input_audio_buffer_transcript_parts.clear()
 
     async def discard_pending_input_audio(
         self,
@@ -42,11 +51,7 @@ class RealtimeInputTranslator:
                     "item_id": self._active_input_item_id,
                 }
             )
-        self._input_speech_started = False
-        self._active_input_item_id = None
-        self._input_audio_buffer_has_audio = False
-        self._input_audio_buffer_had_non_speech = False
-        self._input_audio_buffer_transcript_parts.clear()
+        self._reset_realtime_input_buffer_state()
 
     async def _send_realtime_input_ack(self, event: dict[str, object]) -> None:
         if event.get("type") != "conversation.item.create":
@@ -78,7 +83,24 @@ class RealtimeInputTranslator:
                     )
                 )
                 return None
-            turn_detection_error = self._validate_realtime_turn_detection(session_payload)
+            try:
+                turn_detection_config = self._parse_realtime_turn_detection(session_payload)
+            except ValueError as exc:
+                await self._send_realtime_payload(
+                    self._realtime_error_payload(
+                        "unsupported_turn_detection",
+                        str(exc),
+                        event_id=event.get("event_id"),
+                        param="turn_detection",
+                    )
+                )
+                return None
+            turn_detection_configured, normalized_turn_detection = turn_detection_config
+            turn_detection_error = self._validate_realtime_turn_detection(
+                session_payload,
+                configured=turn_detection_configured,
+                normalized=normalized_turn_detection,
+            )
             if turn_detection_error is not None:
                 await self._send_realtime_payload(
                     self._realtime_error_payload(
@@ -89,17 +111,25 @@ class RealtimeInputTranslator:
                     )
                 )
                 return None
-            self._apply_realtime_session_defaults(session_payload)
             session_payload.update(self._realtime_overlap_fields(session_payload))
             if not self._opened:
+                self._apply_realtime_turn_detection(
+                    configured=turn_detection_configured,
+                    normalized=normalized_turn_detection,
+                )
                 self._opened = True
                 self._initial_session_update = True
-                return self._session_create_from_realtime(session_payload)
-            return {
-                "type": "turn.signal",
-                "event": "session.update",
-                "payload": session_payload,
-            }
+                translated = self._session_create_from_realtime(session_payload)
+            else:
+                translated = {
+                    "type": "turn.signal",
+                    "event": "session.update",
+                    "payload": session_payload,
+                }
+            event_id = event.get("event_id")
+            if turn_detection_configured and isinstance(event_id, str) and event_id:
+                translated["_realtime_event_id"] = event_id
+            return translated
         if event_type == "conversation.item.create":
             item = event.get("item")
             format_error = self._validate_conversation_item_audio_formats(item)
@@ -250,6 +280,7 @@ class RealtimeInputTranslator:
             sample_rate_hz = (
                 event.get("sample_rate_hz") or event.get("sample_rate") or format_rate or self._input_sample_rate_hz
             )
+            channels = event.get("channels", 1)
             if not self._is_supported_realtime_input_format(fmt):
                 await self._send_realtime_payload(
                     self._realtime_error_payload(
@@ -259,38 +290,74 @@ class RealtimeInputTranslator:
                     )
                 )
                 return None
-            try:
-                audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
-                    audio,
-                    fmt,
-                    sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int | float) else None,
-                )
-            except ValueError as exc:
+            if self._turn_detection is not None and (
+                fmt != "pcm16" or channels != 1 or sample_rate_hz not in {16_000, 24_000}
+            ):
                 await self._send_realtime_payload(
                     self._realtime_error_payload(
-                        "bad_event",
-                        str(exc),
+                        "unsupported_audio_format",
+                        "server_vad requires mono PCM16 input at 16 kHz or 24 kHz",
                         event_id=event.get("event_id"),
-                        param="sample_rate_hz",
+                        param="audio.input.format",
                     )
                 )
                 return None
-            looks_like_speech = self._input_looks_like_speech(event, audio=audio, fmt=fmt)
-            self._input_audio_buffer_has_audio = self._input_audio_buffer_has_audio or (
-                looks_like_speech and isinstance(audio, str) and bool(audio)
+            if self._turn_detection is not None:
+                if isinstance(audio, str) and audio:
+                    try:
+                        raw_pcm16 = base64.b64decode(audio, validate=True)
+                    except (binascii.Error, ValueError):
+                        await self._send_realtime_payload(
+                            self._realtime_error_payload(
+                                "bad_audio",
+                                "server_vad input audio must be valid base64-encoded PCM16",
+                                event_id=event.get("event_id"),
+                                param="audio",
+                            )
+                        )
+                        return None
+                    if len(raw_pcm16) % np.dtype("<i2").itemsize:
+                        await self._send_realtime_payload(
+                            self._realtime_error_payload(
+                                "bad_audio",
+                                "server_vad PCM16 input contains an incomplete sample",
+                                event_id=event.get("event_id"),
+                                param="audio",
+                            )
+                        )
+                        return None
+            else:
+                try:
+                    audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
+                        audio,
+                        fmt,
+                        sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int | float) else None,
+                    )
+                except ValueError as exc:
+                    await self._send_realtime_payload(
+                        self._realtime_error_payload(
+                            "bad_event",
+                            str(exc),
+                            event_id=event.get("event_id"),
+                            param="sample_rate_hz",
+                        )
+                    )
+                    return None
+            has_audio_payload = isinstance(audio, str) and bool(audio)
+            looks_like_speech = (
+                has_audio_payload
+                if self._turn_detection is not None
+                else self._input_looks_like_speech(event, audio=audio, fmt=fmt)
             )
-            self._input_audio_buffer_had_non_speech = self._input_audio_buffer_had_non_speech or (
-                not looks_like_speech and isinstance(audio, str) and bool(audio)
-            )
-            if looks_like_speech:
-                await self._emit_input_speech_started(event)
-                self._remember_input_transcript_hint(event)
             payload = {
                 "type": "input_audio_buffer.append",
                 "audio": audio,
                 "format": fmt,
                 "sample_rate_hz": sample_rate_hz,
             }
+            event_id = event.get("event_id")
+            if self._turn_detection is not None and isinstance(event_id, str) and event_id:
+                payload["_realtime_event_id"] = event_id
             video_frames = event.get("video_frames")
             if video_frames is not None:
                 frames_error = self._validate_realtime_video_frames(video_frames, event.get("max_slice_nums"))
@@ -306,10 +373,32 @@ class RealtimeInputTranslator:
                     return None
                 payload["video_frames"] = [frame for frame in video_frames if isinstance(frame, str) and frame]
             self._copy_realtime_input_hints(event, payload)
-            if not looks_like_speech:
+            self._input_audio_buffer_has_audio = self._input_audio_buffer_has_audio or (
+                looks_like_speech and has_audio_payload
+            )
+            self._input_audio_buffer_had_non_speech = self._input_audio_buffer_had_non_speech or (
+                not looks_like_speech and has_audio_payload
+            )
+            if looks_like_speech and self._turn_detection is None:
+                await self._emit_input_speech_started(event)
+                self._remember_input_transcript_hint(event)
+            if not looks_like_speech and self._turn_detection is None:
                 payload["is_speech"] = False
             return payload
         if event_type == "input_audio_buffer.commit":
+            if self._turn_detection is not None:
+                await self._send_realtime_payload(
+                    self._realtime_error_payload(
+                        "server_vad_manual_commit_unsupported",
+                        (
+                            "input_audio_buffer.commit is not supported while server_vad is enabled; "
+                            "wait for server endpointing, or start a session with turn_detection=null "
+                            "to use manual commit"
+                        ),
+                        event_id=event.get("event_id"),
+                    )
+                )
+                return None
             if not self._input_audio_buffer_has_audio:
                 if self._input_audio_buffer_had_non_speech:
                     self._input_audio_buffer_had_non_speech = False
@@ -338,7 +427,7 @@ class RealtimeInputTranslator:
             payload = {
                 "type": "input_audio_buffer.commit",
                 "final": event.get("final", True),
-                "realtime_item_id": item_id,
+                "item_id": item_id,
                 "response_create": bool(event.get("response_create", False)),
             }
             if transcript:
@@ -550,8 +639,13 @@ class RealtimeInputTranslator:
         item_id = item.get("id")
         previous_item_id = self._previous_item_id(item_id) if isinstance(item_id, str) else None
         if isinstance(item_id, str) and item_id:
+            already_known = item_id in self._conversation_items
             self._conversation_items[item_id] = item
-            self._last_conversation_item_id = item_id
+            # Completing an item that was already added must not move it to the
+            # end of the conversation. A later user item may have been added
+            # while this response was still in progress.
+            if not already_known:
+                self._last_conversation_item_id = item_id
         return {
             "type": "conversation.item.done",
             "previous_item_id": previous_item_id,
@@ -991,8 +1085,11 @@ class RealtimeInputTranslator:
                 return "video_frames entries must be JPEG or PNG images"
         return None
 
-    @staticmethod
-    def _validate_realtime_turn_detection(session_payload: dict[str, object]) -> str | None:
+    @classmethod
+    def _realtime_turn_detection_value(
+        cls,
+        session_payload: dict[str, object],
+    ) -> tuple[bool, dict[str, object] | None]:
         configured_values: list[tuple[str, object]] = []
         if "turn_detection" in session_payload:
             configured_values.append(("turn_detection", session_payload["turn_detection"]))
@@ -1001,15 +1098,86 @@ class RealtimeInputTranslator:
             audio_input = audio_config.get("input")
             if isinstance(audio_input, dict) and "turn_detection" in audio_input:
                 configured_values.append(("audio.input.turn_detection", audio_input["turn_detection"]))
-        for field_path, turn_detection in configured_values:
-            if turn_detection is None:
-                continue
-            turn_detection_type = turn_detection.get("type") if isinstance(turn_detection, dict) else turn_detection
-            return (
-                f"{field_path}={turn_detection_type!r} is not implemented by the duplex Realtime adapter; "
-                "set turn_detection to null and commit input explicitly, or use the model-owned duplex policy"
-            )
+        if not configured_values:
+            return False, None
+        first_path, first_value = configured_values[0]
+        first_normalized = None if first_value is None else ServerVADConfig.from_value(first_value).as_dict()
+        for field_path, value in configured_values[1:]:
+            normalized = None if value is None else ServerVADConfig.from_value(value).as_dict()
+            if normalized != first_normalized:
+                raise ValueError(f"{first_path} and {field_path} must not specify conflicting values")
+        return True, first_normalized
+
+    @classmethod
+    def _parse_realtime_turn_detection(
+        cls,
+        session_payload: dict[str, object],
+    ) -> tuple[bool, dict[str, object] | None]:
+        return cls._realtime_turn_detection_value(session_payload)
+
+    def _validate_realtime_turn_detection(
+        self,
+        session_payload: dict[str, object],
+        *,
+        configured: bool,
+        normalized: dict[str, object] | None,
+    ) -> str | None:
+        if (
+            configured
+            and self._turn_detection_config_locked
+            and (not self._turn_detection_configured or normalized != self._turn_detection)
+        ):
+            return "turn_detection cannot be changed after the first audio append"
+        effective_turn_detection = normalized if configured else self._turn_detection
+        if effective_turn_detection is not None:
+            audio_config = session_payload.get("audio")
+            audio_input = audio_config.get("input") if isinstance(audio_config, dict) else None
+            raw_format = session_payload.get("input_audio_format")
+            if raw_format is None and isinstance(audio_input, dict):
+                raw_format = audio_input.get("format")
+            parsed_format, format_rate = self._parse_realtime_audio_format(raw_format)
+            if parsed_format is None:
+                parsed_format = self._input_audio_format
+            sample_rate = session_payload.get("sample_rate_hz") or session_payload.get("sample_rate")
+            if sample_rate is None and isinstance(audio_input, dict):
+                sample_rate = audio_input.get("sample_rate_hz") or audio_input.get("sample_rate")
+            if sample_rate is None:
+                sample_rate = format_rate or self._input_sample_rate_hz
+            channels = audio_input.get("channels") if isinstance(audio_input, dict) else None
+            if channels is None and isinstance(raw_format, dict):
+                channels = raw_format.get("channels")
+            if channels is None:
+                channels = 1
+            if parsed_format != "pcm16" or channels != 1 or sample_rate not in {16_000, 24_000}:
+                return "server_vad requires mono PCM16 input at 16 kHz or 24 kHz"
         return None
+
+    def _apply_realtime_turn_detection(
+        self,
+        *,
+        configured: bool,
+        normalized: dict[str, object] | None,
+    ) -> None:
+        if configured:
+            self._turn_detection_configured = True
+            self._turn_detection = normalized
+
+    def commit_realtime_session_update(self, session_payload: dict[str, object]) -> None:
+        """Apply protocol state only after Serving accepts a session update."""
+        configured, normalized = self._parse_realtime_turn_detection(session_payload)
+        self._apply_realtime_turn_detection(
+            configured=configured,
+            normalized=normalized,
+        )
+        self._apply_realtime_session_defaults(session_payload)
+
+    def lock_realtime_turn_detection_config(self) -> None:
+        """Freeze turn detection after Serving accepts the first audio append."""
+        self._turn_detection_config_locked = True
+
+    def clear_realtime_input_buffer_state(self) -> None:
+        """Synchronize protocol input state after Serving discards the buffer."""
+        self._reset_realtime_input_buffer_state()
 
     @staticmethod
     def _input_audio_transcription_config(session_payload: dict[str, object]) -> dict[str, object] | None:
@@ -1042,35 +1210,46 @@ class RealtimeInputTranslator:
         return None
 
     async def _conversation_item_to_duplex(self, event: dict[str, object]) -> dict[str, object] | None:
-        item = event.get("item")
-        if not isinstance(item, dict):
+        raw_item = event.get("item")
+        if not isinstance(raw_item, dict):
             return None
-        item = self._normalize_conversation_item(item)
-        previous_item_id = event.get("previous_item_id")
-        if isinstance(previous_item_id, str):
-            item["_previous_item_id"] = previous_item_id
-        item_id = str(item["id"])
-        item_type = item.get("type")
-        role = item.get("role")
+        public_item = self._normalize_conversation_item(raw_item)
+        item_id = str(public_item["id"])
+        item_type = public_item.get("type")
+        role = public_item.get("role")
         if item_type != "message" or role in {"assistant", "system"}:
+            event["item"] = public_item
             return {
                 "type": "turn.signal",
                 "event": "conversation.item.create",
-                "payload": {"item": item},
+                "payload": {"item": public_item},
             }
-        self._conversation_items[item_id] = item
-        content = item.get("content")
+        content = public_item.get("content")
         if not isinstance(content, list):
             return None
+        server_vad_full_audio_item = self._turn_detection is not None
         text_chunks: list[str] = []
         audio_events: list[dict[str, object]] = []
+        normalized_content: list[object] = []
+        normalized_full_audio = False
         for part in content:
             if not isinstance(part, dict):
+                normalized_content.append(part)
                 continue
             if part.get("type") in {"input_text", "text"} and isinstance(part.get("text"), str):
                 text_chunks.append(str(part["text"]))
             if part.get("type") in {"input_audio", "audio"}:
                 audio = part.get("audio") or part.get("data")
+                if not isinstance(audio, str) or not audio:
+                    await self._send_realtime_payload(
+                        self._realtime_error_payload(
+                            "bad_audio",
+                            "conversation.item.create input_audio must not be empty",
+                            event_id=event.get("event_id"),
+                            param="item.content.audio",
+                        )
+                    )
+                    return None
                 fmt, format_rate = self._parse_realtime_audio_format(part.get("format") or self._input_audio_format)
                 sample_rate_hz = (
                     part.get("sample_rate_hz") or part.get("sample_rate") or format_rate or self._input_sample_rate_hz
@@ -1086,14 +1265,37 @@ class RealtimeInputTranslator:
                 except ValueError as exc:
                     await self._send_realtime_payload(
                         self._realtime_error_payload(
-                            "bad_event",
+                            "bad_audio",
                             str(exc),
                             event_id=event.get("event_id"),
-                            param="sample_rate_hz",
+                            param="item.content.audio",
                         )
                     )
                     return None
-                if not isinstance(audio, str) or not audio:
+                if server_vad_full_audio_item:
+                    try:
+                        audio, fmt, sample_rate_hz = self._normalize_complete_audio_item_part(
+                            audio,
+                            fmt,
+                            sample_rate_hz,
+                        )
+                    except ValueError as exc:
+                        await self._send_realtime_payload(
+                            self._realtime_error_payload(
+                                "bad_audio",
+                                str(exc),
+                                event_id=event.get("event_id"),
+                                param="item.content.audio",
+                            )
+                        )
+                        return None
+                    normalized_part = dict(part)
+                    normalized_part.pop("data", None)
+                    normalized_part["audio"] = audio
+                    normalized_part["format"] = fmt
+                    normalized_part["sample_rate_hz"] = sample_rate_hz
+                    normalized_content.append(normalized_part)
+                    normalized_full_audio = True
                     continue
                 speech_hints = dict(event)
                 speech_hints.update(part)
@@ -1109,30 +1311,76 @@ class RealtimeInputTranslator:
                 self._copy_realtime_input_hints(part, payload)
                 self._copy_realtime_input_hints(event, payload)
                 audio_events.append(payload)
+                continue
+            normalized_content.append(part)
+        if server_vad_full_audio_item and normalized_full_audio:
+            history_item = dict(public_item)
+            history_item["content"] = normalized_content
+            history_item["status"] = "completed"
+            event["item"] = public_item
+            self._conversation_items[item_id] = public_item
+            return {
+                "type": "turn.signal",
+                "event": "conversation.item.create",
+                "payload": {
+                    "item": public_item,
+                    "history_item": history_item,
+                },
+            }
         if audio_events:
             self._input_audio_buffer_has_audio = True
-            transcript = self._input_transcript_from_item(item)
+            transcript = self._input_transcript_from_item(public_item)
             for extra_event in audio_events[1:]:
                 self._pending_outbound.put_nowait(extra_event)
             commit_payload: dict[str, object] = {
                 "type": "input_audio_buffer.commit",
                 "final": True,
-                "realtime_item_id": item_id,
+                "item_id": item_id,
                 "response_create": False,
             }
             if transcript:
                 commit_payload["transcript"] = transcript
             self._pending_outbound.put_nowait(commit_payload)
+            event["item"] = public_item
+            self._conversation_items[item_id] = public_item
             return audio_events[0]
         if not text_chunks:
             return None
-        text_item = dict(item)
+        text_item = dict(public_item)
         text_item["status"] = "completed"
+        event["item"] = text_item
+        self._conversation_items[item_id] = text_item
         return {
             "type": "turn.signal",
             "event": "conversation.item.create",
             "payload": {"item": text_item},
         }
+
+    @staticmethod
+    def _normalize_complete_audio_item_part(
+        audio: str,
+        fmt: object,
+        sample_rate_hz: object,
+    ) -> tuple[str, str, int]:
+        """Package a complete Realtime audio item for the chat fallback path."""
+        if fmt == "wav":
+            if not isinstance(sample_rate_hz, int | float) or sample_rate_hz <= 0:
+                raise ValueError("conversation.item.create input_audio requires a valid sample rate")
+            return audio, "wav", int(sample_rate_hz)
+        if fmt != "pcm_f32le" or not isinstance(sample_rate_hz, int | float) or sample_rate_hz <= 0:
+            raise ValueError("conversation.item.create input_audio could not be normalized")
+        try:
+            raw = base64.b64decode(audio, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("conversation.item.create input_audio is not valid Base64") from exc
+        if not raw or len(raw) % np.dtype(np.float32).itemsize:
+            raise ValueError("conversation.item.create input_audio contains incomplete float32 samples")
+        samples = np.frombuffer(raw, dtype="<f4")
+        return (
+            encode_float32_mono_wav_base64(samples, sample_rate_hz=int(sample_rate_hz)),
+            "wav",
+            int(sample_rate_hz),
+        )
 
     def _remember_input_transcript_hint(self, event: dict[str, object]) -> None:
         transcript = event.get("transcript")

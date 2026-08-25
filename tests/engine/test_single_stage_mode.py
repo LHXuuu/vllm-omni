@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import socket
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -373,14 +374,28 @@ class TestSingleStageModeDetection:
         mocker: MockerFixture,
         *,
         stage_cfgs: list[Any] | None = None,
+        resolved_config_path: str = "/fake/path",
+        patch_pipeline_config: bool = True,
+        patch_runtime_config: bool = True,
         **kwargs: Any,
     ) -> AsyncOmniEngine:
         mock_stage_configs = stage_cfgs or [_make_stage_cfg(0)]
 
+        if patch_pipeline_config:
+            mocker.patch.object(
+                StageConfigFactory,
+                "get_pipeline_config",
+                return_value=None,
+            )
+        if patch_runtime_config:
+            mocker.patch(
+                "vllm_omni.engine.async_omni_engine.load_deploy_config",
+                return_value=SimpleNamespace(duplex_session=DuplexSessionRuntimeConfig()),
+            )
         mocker.patch.object(
             AsyncOmniEngine,
             "_resolve_stage_configs",
-            return_value=("/fake/path", mock_stage_configs),
+            return_value=(resolved_config_path, mock_stage_configs),
         )
         mocker.patch.object(AsyncOmniEngine, "_bootstrap_orchestrator")
         mock_thread_cls = mocker.patch("threading.Thread")
@@ -442,6 +457,9 @@ class TestSingleStageModeDetection:
         engine = self._make_engine_no_thread(
             mocker,
             deploy_config="/fake/duplex.yaml",
+            resolved_config_path="/fake/duplex.yaml",
+            patch_pipeline_config=False,
+            patch_runtime_config=False,
         )
 
         get_pipeline_config.assert_called_once_with(
@@ -450,6 +468,59 @@ class TestSingleStageModeDetection:
             deploy_config_path="/fake/duplex.yaml",
         )
         load_deploy_config.assert_called_once_with("/fake/duplex.yaml")
+        assert engine.duplex_session_config is duplex_session
+
+    def test_bare_deploy_name_loads_runtime_config_from_resolved_path(self, mocker: MockerFixture):
+        duplex_session = DuplexSessionRuntimeConfig(server_vad_model_path="/models/silero_vad.onnx")
+        resolved_path = "/package/vllm_omni/deploy/qwen3_omni_moe.yaml"
+        mocker.patch(
+            "vllm_omni.engine.async_omni_engine.StageConfigFactory.get_pipeline_config",
+            return_value=None,
+        )
+        load_deploy_config = mocker.patch(
+            "vllm_omni.engine.async_omni_engine.load_deploy_config",
+            return_value=SimpleNamespace(duplex_session=duplex_session),
+        )
+
+        engine = self._make_engine_no_thread(
+            mocker,
+            deploy_config="qwen3_omni_moe.yaml",
+            resolved_config_path=resolved_path,
+            patch_pipeline_config=False,
+            patch_runtime_config=False,
+        )
+
+        load_deploy_config.assert_called_once_with(resolved_path)
+        assert engine.duplex_session_config is duplex_session
+
+    def test_auto_discovered_deploy_loads_duplex_runtime_config(
+        self,
+        tmp_path: Path,
+        mocker: MockerFixture,
+    ) -> None:
+        deploy_path = tmp_path / "qwen3_omni_moe.yaml"
+        deploy_path.write_text(
+            "duplex_session:\n  server_vad_model_path: /models/silero_vad.onnx\nstages: []\n",
+            encoding="utf-8",
+        )
+        duplex_session = DuplexSessionRuntimeConfig(server_vad_model_path="/models/silero_vad.onnx")
+        mocker.patch(
+            "vllm_omni.engine.async_omni_engine.StageConfigFactory.get_pipeline_config",
+            return_value=None,
+        )
+        load_deploy_config = mocker.patch(
+            "vllm_omni.engine.async_omni_engine.load_deploy_config",
+            return_value=SimpleNamespace(duplex_session=duplex_session),
+        )
+
+        engine = self._make_engine_no_thread(
+            mocker,
+            resolved_config_path=str(deploy_path),
+            patch_pipeline_config=False,
+            patch_runtime_config=False,
+        )
+
+        load_deploy_config.assert_called_once_with(str(deploy_path))
         assert engine.duplex_session_config is duplex_session
 
     def test_single_stage_mode_without_stage_id_has_no_filter(self, mocker: MockerFixture):
@@ -515,6 +586,10 @@ class TestEndpointRestrictionsTrustRemoteCode:
         StageConfigFactory.try_infer_model_type.cache_clear()
 
     def _make_engine_no_thread(self, mocker: MockerFixture, **kwargs: Any) -> AsyncOmniEngine:
+        mocker.patch(
+            "vllm_omni.engine.async_omni_engine.load_deploy_config",
+            return_value=SimpleNamespace(duplex_session=DuplexSessionRuntimeConfig()),
+        )
         mocker.patch.object(
             AsyncOmniEngine,
             "_resolve_stage_configs",

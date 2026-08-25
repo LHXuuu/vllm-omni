@@ -133,6 +133,12 @@ AUDIO_UNDERRUN_S = METRIC_PREFIX + AUDIO_UNDERRUN + "_s"
 AUDIO_CONTINUITY_OK_METRIC = METRIC_PREFIX + AUDIO_CONTINUITY_OK
 AUDIO_SKIPPED_REQUESTS_METRIC = METRIC_PREFIX + AUDIO_SKIPPED_REQUESTS
 
+# Realtime Server VAD serving metrics.
+REALTIME_VAD_ACTIVE_SESSIONS = METRIC_PREFIX + "realtime_vad_active_sessions"
+REALTIME_VAD_INFERENCE_LATENCY_S = METRIC_PREFIX + "realtime_vad_inference_latency_s"
+REALTIME_VAD_ENDPOINT_DELAY_S = METRIC_PREFIX + "realtime_vad_endpoint_delay_s"
+REALTIME_VAD_ERRORS = METRIC_PREFIX + "realtime_vad_errors"
+
 
 # ============================================================================
 # Diffusion family (per-stage + per-replica diffusion timing breakdowns)
@@ -172,6 +178,8 @@ AUDIO_CONTINUITY_LABELS = ("model_name", "stage", "replica", "threshold_ms")
 # path (e.g. code2wav rejecting malformed codec input) can be distinguished
 # from other "200 OK + empty audio" cases.
 AUDIO_SKIPPED_LABELS = ("model_name", "stage", "replica", "reason")
+REALTIME_VAD_LABELS = ("model_name",)
+REALTIME_VAD_ERROR_LABELS = ("model_name", "reason")
 
 # Cross-stage transfer label set. Each observation is one physical hop from
 # (from_stage, from_replica) to (to_stage, to_replica).

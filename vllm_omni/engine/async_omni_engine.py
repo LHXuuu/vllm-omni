@@ -194,9 +194,6 @@ class AsyncOmniEngine:
             pipeline_config.duplex_serving_adapter if pipeline_config is not None else None
         )
         self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
-        self.duplex_session_config = DuplexSessionRuntimeConfig()
-        if deploy_config_path is not None:
-            self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session
 
         # Tri-state: None means "not specified" — the deploy yaml's per-stage
         # trust_remote_code stays in effect. An explicit True/False here is a
@@ -208,6 +205,13 @@ class AsyncOmniEngine:
             kwargs,
             trust_remote_code=trust_remote_code,
         )
+        # Stage resolution normalizes explicit, bare-name, and auto-discovered
+        # deploy configs to the path that was actually selected. Reuse that
+        # path for pipeline-wide session settings as well.
+        runtime_config_path = self.config_path
+        self.duplex_session_config = DuplexSessionRuntimeConfig()
+        if runtime_config_path is not None:
+            self.duplex_session_config = load_deploy_config(runtime_config_path).duplex_session
 
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None

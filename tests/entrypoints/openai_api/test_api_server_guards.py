@@ -544,6 +544,53 @@ def test_websocket_routes_emit_stable_unavailable_frames_and_close(path: str, pa
                 websocket.receive_text()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("duplex_query", "duplex_available", "expected_handler"),
+    [
+        (None, True, "duplex"),
+        ("1", True, "duplex"),
+        ("true", True, "duplex"),
+        ("0", True, "legacy"),
+        ("false", True, "legacy"),
+        (None, False, "legacy"),
+    ],
+)
+async def test_realtime_route_defaults_to_duplex_and_preserves_explicit_legacy_selection(
+    monkeypatch,
+    duplex_query: str | None,
+    duplex_available: bool,
+    expected_handler: str,
+) -> None:
+    calls: list[str] = []
+
+    class _DuplexHandler:
+        async def handle_realtime_session(self, websocket) -> None:
+            calls.append("duplex")
+
+    class _LegacyConnection:
+        def __init__(self, websocket, serving) -> None:
+            assert serving is legacy_serving
+
+        async def handle_connection(self) -> None:
+            calls.append("legacy")
+
+    legacy_serving = object()
+    state = State()
+    state.openai_serving_duplex = _DuplexHandler() if duplex_available else None
+    state.openai_serving_realtime = legacy_serving
+    query_params = {} if duplex_query is None else {"duplex": duplex_query}
+    websocket = SimpleNamespace(
+        app=SimpleNamespace(state=state),
+        query_params=query_params,
+    )
+    monkeypatch.setattr(api_server, "RealtimeConnection", _LegacyConnection)
+
+    await api_server.realtime_websocket(websocket)
+
+    assert calls == [expected_handler]
+
+
 def test_health_without_engine_returns_stable_unhealthy_response() -> None:
     """Lock ``/health`` with no engine initialized.
 
@@ -808,3 +855,73 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
         must_be_wired=_MULTISTAGE_MUST_BE_WIRED,
         must_be_none=_MULTISTAGE_MUST_BE_NONE,
     )
+
+
+@pytest.mark.asyncio
+async def test_multistage_duplex_handler_allows_missing_runtime_adapter(monkeypatch) -> None:
+    """A turn-based duplex deployment does not require a native adapter."""
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+    from vllm_omni.experimental.fullduplex.openai.serving import OmniDuplexSessionHandler
+
+    engine = _FakeEngineClient(
+        stage_configs=[SimpleNamespace(session_mode="duplex")],
+        vllm_config=SimpleNamespace(
+            lora_config=None,
+            model_config=SimpleNamespace(),
+            parallel_config=SimpleNamespace(_api_process_rank=0),
+        ),
+    )
+    engine.duplex_serving_adapter_path = None
+    engine.duplex_session_config = DuplexSessionRuntimeConfig(server_vad_model_path="/models/silero_vad.onnx")
+
+    class _FakeModels:
+        def __init__(self, *args, **kwargs):
+            self.base_model_paths = kwargs.get("base_model_paths") or []
+
+        async def init_static_loras(self):
+            return None
+
+    class _FakeCtor:
+        def __init__(self, *args, **kwargs):
+            engine_client = args[0] if args else kwargs.get("engine_client")
+            if engine_client is not None:
+                self.engine_client = engine_client
+
+        def warmup(self):
+            return None
+
+    class _FakeSpeech(_FakeCtor):
+        async def warmup(self):
+            return None
+
+    monkeypatch.setattr(api_server, "load_chat_template", lambda *_a, **_k: None)
+    monkeypatch.setattr(api_server, "process_lora_modules", lambda modules, _defaults: modules or [])
+    monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
+    monkeypatch.setattr(api_server, "OnlineRenderer", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingResponses", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingChat", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingChatBatch", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingCompletion", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingPooling", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingEmbedding", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingClassification", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingScores", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingTokenization", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingTranscription", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingTranslation", _FakeCtor)
+    monkeypatch.setattr(api_server, "AnthropicServingMessages", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingTokens", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingSpeech", _FakeSpeech)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingAudioGenerate", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _FakeCtor)
+    monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
+    monkeypatch.setattr(api_server, "OpenAIServingRealtime", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
+    monkeypatch.setattr(api_server, "should_enable_duplex_endpoint", lambda *_a, **_k: True)
+
+    state = State()
+    await api_server.omni_init_app_state(engine, state, _minimal_args())
+
+    assert isinstance(state.openai_serving_duplex, OmniDuplexSessionHandler)
+    assert state.openai_serving_duplex._serving_runtime_adapter is None
+    assert state.openai_serving_duplex._duplex_session_config is engine.duplex_session_config
