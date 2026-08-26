@@ -317,7 +317,9 @@ def test_threshold_endpoint_policy_clamps_silero_exit_threshold():
 
     assert first_silence.speech_stopped is False
     assert stopped.speech_stopped is True
-    assert stopped.audio_end_ms == 10
+    # The committed audio ends at 30 ms: 10 ms of speech followed by the
+    # 20 ms of silence required to detect the endpoint.
+    assert stopped.audio_end_ms == 30
     assert stopped.endpoint_delay_ms == 20
     assert policy.speech_active is False
 

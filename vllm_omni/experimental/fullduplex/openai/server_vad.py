@@ -261,12 +261,14 @@ class ThresholdEndpointPolicy:
         if self._silence_samples < silence_limit:
             return SpeechEndpointDecision()
 
-        speech_end_sample = frame_start_sample + frame_samples - self._silence_samples
+        # OpenAI defines ``audio_end_ms`` as the end of the audio sent to the
+        # model, including the trailing silence used for endpoint detection.
+        audio_end_sample = frame_start_sample + frame_samples
         endpoint_delay_ms = round(self._silence_samples * 1000 / self.sample_rate_hz)
         self.reset()
         return SpeechEndpointDecision(
             speech_stopped=True,
-            audio_end_ms=max(0, round(speech_end_sample * 1000 / self.sample_rate_hz)),
+            audio_end_ms=max(0, round(audio_end_sample * 1000 / self.sample_rate_hz)),
             endpoint_delay_ms=endpoint_delay_ms,
         )
 
