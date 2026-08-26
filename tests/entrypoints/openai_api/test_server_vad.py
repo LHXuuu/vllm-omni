@@ -294,6 +294,34 @@ def test_threshold_endpoint_policy_uses_silero_v62_exit_hysteresis():
     assert policy.speech_active is False
 
 
+def test_threshold_endpoint_policy_clamps_silero_exit_threshold():
+    policy = ThresholdEndpointPolicy(
+        ServerVADConfig(threshold=0.1, silence_duration_ms=20),
+        sample_rate_hz=16_000,
+    )
+    frame_samples = 160
+
+    started = policy.update(0.9, frame_start_sample=0, frame_samples=frame_samples)
+    assert started.speech_started is True
+
+    first_silence = policy.update(
+        0.0,
+        frame_start_sample=frame_samples,
+        frame_samples=frame_samples,
+    )
+    stopped = policy.update(
+        0.0,
+        frame_start_sample=2 * frame_samples,
+        frame_samples=frame_samples,
+    )
+
+    assert first_silence.speech_stopped is False
+    assert stopped.speech_stopped is True
+    assert stopped.audio_end_ms == 10
+    assert stopped.endpoint_delay_ms == 20
+    assert policy.speech_active is False
+
+
 @pytest.mark.asyncio
 async def test_server_vad_complete_audio_item_bypasses_input_buffer_and_normalizes_to_wav():
     protocol = NativeRealtimeSessionProtocol({})

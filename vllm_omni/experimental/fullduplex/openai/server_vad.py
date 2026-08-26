@@ -246,9 +246,10 @@ class ThresholdEndpointPolicy:
 
         # Match Silero v6.2's streaming VAD hysteresis: activation uses the
         # configured threshold, while potential speech end starts only below
-        # ``threshold - 0.15``. Once a silence candidate exists, intermediate
-        # frames keep elapsed time moving but cannot themselves close the turn.
-        negative_threshold = self.config.threshold - 0.15
+        # ``max(threshold - 0.15, 0.01)``. Once a silence candidate exists,
+        # intermediate frames keep elapsed time moving but cannot themselves
+        # close the turn.
+        negative_threshold = max(self.config.threshold - 0.15, 0.01)
         below_negative_threshold = probability < negative_threshold
         if not below_negative_threshold and self._silence_samples == 0:
             return SpeechEndpointDecision()
