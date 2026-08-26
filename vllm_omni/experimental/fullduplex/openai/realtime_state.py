@@ -21,6 +21,24 @@ REALTIME_OUTPUT_AUDIO_FORMATS = {
     "g711_ulaw",
     "g711_alaw",
 }
+REALTIME_PCM_DEFAULT_SAMPLE_RATE_HZ = 24_000
+REALTIME_PCM_F32_DEFAULT_SAMPLE_RATE_HZ = 16_000
+REALTIME_G711_DEFAULT_SAMPLE_RATE_HZ = 8_000
+
+
+def realtime_default_sample_rate_hz(fmt: object) -> int | None:
+    if not isinstance(fmt, str):
+        return None
+    normalized = fmt.lower()
+    if normalized in {"pcm16", "pcm_s16le", "s16le", "pcm", "audio/pcm"}:
+        return REALTIME_PCM_DEFAULT_SAMPLE_RATE_HZ
+    if normalized in {"pcm_f32le", "audio/pcm_f32le"}:
+        return REALTIME_PCM_F32_DEFAULT_SAMPLE_RATE_HZ
+    if normalized in {"g711_ulaw", "g711_alaw", "audio/g711_ulaw", "audio/g711_alaw"}:
+        return REALTIME_G711_DEFAULT_SAMPLE_RATE_HZ
+    return None
+
+
 REALTIME_ERROR_TYPES_BY_CODE = {
     "bad_event": "invalid_request_error",
     "bad_audio": "invalid_request_error",
@@ -106,7 +124,7 @@ class RealtimeSessionState:
     _default_session_id: object | None = None
     _default_extra_body: dict[str, object] = field(default_factory=dict)
     _input_audio_format: str = "pcm16"
-    _input_sample_rate_hz: int = 16000
+    _input_sample_rate_hz: int = REALTIME_PCM_DEFAULT_SAMPLE_RATE_HZ
     _output_audio_format: str = "pcm16"
     _overlap_silence_rms: float = 0.003
     _send_realtime_json: Any = None

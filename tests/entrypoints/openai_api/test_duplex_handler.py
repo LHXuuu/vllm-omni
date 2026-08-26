@@ -749,6 +749,7 @@ async def test_native_realtime_protocol_accepts_server_vad():
             "type": "session.update",
             "model": "test-model",
             "session_id": "rt-turn-detection",
+            "input_audio_format": {"type": "audio/pcm", "rate": 16_000},
             "turn_detection": {
                 "type": "server_vad",
                 "interrupt_response": False,
@@ -780,11 +781,11 @@ async def test_native_realtime_protocol_accepts_server_vad():
             "type": "input_audio_buffer.append",
             "audio": audio,
             "format": "pcm16",
-            "sample_rate_hz": 16_000,
         }
     )
     assert append is not None
     assert append["format"] == "pcm16"
+    assert append["sample_rate_hz"] == 16_000
     assert not any(event.get("type") == "input_audio_buffer.speech_started" for event in ws.sent)
 
 
@@ -1042,25 +1043,33 @@ async def test_native_realtime_protocol_defers_session_update_state_until_commit
         {
             "type": "session.update",
             "model": "test-model",
+            "input_audio_format": "g711_ulaw",
             "turn_detection": None,
         }
     )
+    assert protocol._input_audio_format == "g711_ulaw"
+    assert protocol._input_sample_rate_hz == 8_000
     translated = await protocol._to_duplex_event(
         {
             "type": "session.update",
+            "input_audio_format": {"type": "audio/pcm"},
             "turn_detection": {"type": "server_vad"},
         }
     )
 
     assert translated is not None
     assert protocol._turn_detection is None
+    assert protocol._input_audio_format == "g711_ulaw"
+    assert protocol._input_sample_rate_hz == 8_000
     protocol.commit_realtime_session_update(translated["payload"])
     assert protocol._turn_detection is not None
     assert protocol._turn_detection["type"] == "server_vad"
+    assert protocol._input_audio_format == "pcm16"
+    assert protocol._input_sample_rate_hz == 24_000
 
 
 @pytest.mark.asyncio
-async def test_native_realtime_protocol_preserves_24khz_server_vad_audio_for_pipeline():
+async def test_native_realtime_protocol_defaults_server_vad_pcm_to_24khz():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     protocol.bind_sender(ws.send_json)
@@ -1070,12 +1079,7 @@ async def test_native_realtime_protocol_preserves_24khz_server_vad_audio_for_pip
             "type": "session.update",
             "session": {
                 "model": "test-model",
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcm", "rate": 24_000},
-                        "turn_detection": {"type": "server_vad"},
-                    }
-                },
+                "audio": {"input": {"turn_detection": {"type": "server_vad"}}},
             },
         }
     )

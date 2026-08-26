@@ -15,6 +15,7 @@ from vllm_omni.experimental.fullduplex.openai.audio import (
 from vllm_omni.experimental.fullduplex.openai.realtime_state import (
     REALTIME_INPUT_AUDIO_FORMATS,
     REALTIME_OUTPUT_AUDIO_FORMATS,
+    realtime_default_sample_rate_hz,
 )
 from vllm_omni.experimental.fullduplex.openai.server_vad import ServerVADConfig
 
@@ -274,12 +275,15 @@ class RealtimeInputTranslator:
             return None
         if event_type == "input_audio_buffer.append":
             audio = event.get("audio") or event.get("delta")
-            fmt, format_rate = self._parse_realtime_audio_format(
-                event.get("format") or event.get("input_audio_format") or self._input_audio_format
-            )
-            sample_rate_hz = (
-                event.get("sample_rate_hz") or event.get("sample_rate") or format_rate or self._input_sample_rate_hz
-            )
+            event_format = event.get("format") or event.get("input_audio_format")
+            fmt, format_rate = self._parse_realtime_audio_format(event_format or self._input_audio_format)
+            sample_rate_hz = event.get("sample_rate_hz") or event.get("sample_rate") or format_rate
+            if sample_rate_hz is None:
+                sample_rate_hz = (
+                    realtime_default_sample_rate_hz(fmt)
+                    if event_format is not None and fmt != self._input_audio_format
+                    else self._input_sample_rate_hz
+                )
             channels = event.get("channels", 1)
             if not self._is_supported_realtime_input_format(fmt):
                 await self._send_realtime_payload(
@@ -807,6 +811,7 @@ class RealtimeInputTranslator:
             audio_input = audio_config.get("input")
             if isinstance(audio_input, dict):
                 input_format = audio_input.get("format")
+        input_format_configured = input_format is not None
         input_format, input_rate = self._parse_realtime_audio_format(input_format)
         if isinstance(input_format, str) and input_format.lower() in REALTIME_INPUT_AUDIO_FORMATS:
             self._input_audio_format = input_format
@@ -831,6 +836,10 @@ class RealtimeInputTranslator:
             sample_rate = input_rate
         if isinstance(sample_rate, int | float) and sample_rate > 0:
             self._input_sample_rate_hz = int(sample_rate)
+        elif input_format_configured:
+            default_input_rate = realtime_default_sample_rate_hz(input_format)
+            if default_input_rate is not None:
+                self._input_sample_rate_hz = default_input_rate
         if isinstance(output_rate, int | float) and output_rate > 0:
             self._output_sample_rate_hz = int(output_rate)
         overlap_fields = self._realtime_overlap_fields(session_payload)
@@ -1142,7 +1151,13 @@ class RealtimeInputTranslator:
             if sample_rate is None and isinstance(audio_input, dict):
                 sample_rate = audio_input.get("sample_rate_hz") or audio_input.get("sample_rate")
             if sample_rate is None:
-                sample_rate = format_rate or self._input_sample_rate_hz
+                sample_rate = format_rate
+            if sample_rate is None:
+                sample_rate = (
+                    realtime_default_sample_rate_hz(parsed_format)
+                    if raw_format is not None and parsed_format != self._input_audio_format
+                    else self._input_sample_rate_hz
+                )
             channels = audio_input.get("channels") if isinstance(audio_input, dict) else None
             if channels is None and isinstance(raw_format, dict):
                 channels = raw_format.get("channels")
