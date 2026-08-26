@@ -978,6 +978,41 @@ def test_native_realtime_protocol_response_done_does_not_reorder_conversation_ta
     assert second_item_added["previous_item_id"] == "item-second-user"
 
 
+def test_native_realtime_protocol_projects_input_commit_in_openai_order():
+    protocol = NativeRealtimeSessionProtocol(TimedWebSocket())  # type: ignore[arg-type]
+    client_event_id = "client-input-commit"
+
+    events = protocol.encode_outbound_event(
+        {
+            "type": "input.committed",
+            "item_id": "item-user-audio",
+            "message": {"role": "user"},
+            "event_id": client_event_id,
+        }
+    )
+
+    assert [event["type"] for event in events] == [
+        "input_audio_buffer.committed",
+        "conversation.item.added",
+        "conversation.item.done",
+    ]
+    committed, added, done = events
+    assert set(committed) == {
+        "event_id",
+        "item_id",
+        "previous_item_id",
+        "type",
+    }
+    assert set(added) == {"event_id", "item", "previous_item_id", "type"}
+    assert set(done) == {"event_id", "item", "previous_item_id", "type"}
+    assert committed["item_id"] == added["item"]["id"] == done["item"]["id"]
+    assert committed["previous_item_id"] == added["previous_item_id"] == done["previous_item_id"]
+    server_event_ids = [event["event_id"] for event in events]
+    assert len(set(server_event_ids)) == len(events)
+    assert client_event_id not in server_event_ids
+    assert all(isinstance(event_id, str) and event_id.startswith("event_") for event_id in server_event_ids)
+
+
 def test_duplex_session_deletes_pending_server_vad_turn():
     session = DuplexSession(
         "sid-delete-pending-vad-turn",
@@ -1214,7 +1249,11 @@ async def test_realtime_server_vad_commits_without_client_commit(sample_rate_hz:
             },
         }
     )
-    pcm16 = np.zeros((sample_rate_hz // 100) * 5, dtype="<i2")
+    # The streaming polyphase resampler retains a small amount of right
+    # context. Supply it at 24 kHz so five complete 16 kHz VAD frames are
+    # available without flushing the still-open input stream.
+    right_context_samples = 18 if sample_rate_hz == 24_000 else 0
+    pcm16 = np.zeros((sample_rate_hz // 100) * 5 + right_context_samples, dtype="<i2")
     ws.put(
         {
             "type": "input_audio_buffer.append",
@@ -1236,6 +1275,13 @@ async def test_realtime_server_vad_commits_without_client_commit(sample_rate_hz:
         "input_audio_buffer.speech_stopped"
     )
     assert event_types.index("input_audio_buffer.speech_stopped") < event_types.index("input_audio_buffer.committed")
+    assert event_types.index("input_audio_buffer.committed") < event_types.index("conversation.item.added")
+    assert event_types.index("conversation.item.added") < event_types.index("conversation.item.done")
+    assert "conversation.item.created" not in event_types
+    committed = next(event for event in ws.sent if event.get("type") == "input_audio_buffer.committed")
+    added = next(event for event in ws.sent if event.get("type") == "conversation.item.added")
+    done = next(event for event in ws.sent if event.get("type") == "conversation.item.done")
+    assert committed["item_id"] == added["item"]["id"] == done["item"]["id"]
     assert "response.created" not in event_types
     assert engine.opened == []
     assert engine.signals == []

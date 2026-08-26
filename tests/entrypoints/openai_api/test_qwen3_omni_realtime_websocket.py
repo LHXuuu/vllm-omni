@@ -298,7 +298,6 @@ async def _run_realtime_audio_roundtrip(
                         "input_audio_buffer.speech_started",
                         "input_audio_buffer.speech_stopped",
                         "conversation.item.added",
-                        "conversation.item.created",
                         "conversation.item.done",
                         "response.output_item.added",
                         "response.content_part.added",

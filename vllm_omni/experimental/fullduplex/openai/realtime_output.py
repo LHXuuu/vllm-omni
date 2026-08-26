@@ -223,7 +223,7 @@ class RealtimeOutputProjector:
                 else self._pop_pending_commit_item_id()
             )
             item = self._conversation_items.get(item_id)
-            created_payload: list[dict[str, object]] = []
+            payloads = [self._input_audio_buffer_committed_event(item_id=item_id)]
             if item is None:
                 message = event.get("message")
                 no_response = event.get("no_response") is True
@@ -241,11 +241,8 @@ class RealtimeOutputProjector:
                     ),
                 }
                 self._conversation_items[item_id] = item
-                created_payload.extend(self._conversation_item_added_events(item))
+                payloads.extend(self._conversation_item_added_events(item))
             item["status"] = "completed"
-            payloads = created_payload + [
-                self._input_audio_buffer_committed_event(item_id=item_id, event=event),
-            ]
             transcription_event = self._input_audio_transcription_completed_event(item_id, item)
             if transcription_event is not None:
                 payloads.append(transcription_event)
@@ -329,7 +326,12 @@ class RealtimeOutputProjector:
                 if item.get("status") == "completed":
                     payloads.append(self._conversation_item_done_event(item))
                 return payloads
-            return [{"type": "conversation.item.created", "item": item, "event": event}]
+            return [
+                self._realtime_error_payload(
+                    "invalid_conversation_item",
+                    "Conversation item payload is missing or invalid",
+                )
+            ]
         if event_type == "conversation.item.deleted":
             item_id = event.get("item_id")
             if isinstance(item_id, str):

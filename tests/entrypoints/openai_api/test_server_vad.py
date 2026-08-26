@@ -513,11 +513,10 @@ async def test_server_vad_complete_audio_item_keeps_wire_item_unchanged():
         if payload["type"]
         in {
             "conversation.item.added",
-            "conversation.item.created",
             "conversation.item.done",
         }
     ]
-    assert len(wire_items) == 3
+    assert len(wire_items) == 2
     assert all(item == wire_items[0] for item in wire_items)
     assert wire_items[0]["content"] == [{"type": "input_audio", "audio": public_audio}]
 

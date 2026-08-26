@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-from typing import Any
 from uuid import uuid4
 
 import numpy as np
@@ -632,11 +631,6 @@ class RealtimeInputTranslator:
                 "previous_item_id": previous_item_id,
                 "item": item,
             },
-            {
-                "type": "conversation.item.created",
-                "previous_item_id": previous_item_id,
-                "item": item,
-            },
         ]
 
     def _conversation_item_done_event(self, item: dict[str, object]) -> dict[str, object]:
@@ -730,13 +724,11 @@ class RealtimeInputTranslator:
         self,
         *,
         item_id: str,
-        event: dict[str, Any],
     ) -> dict[str, object]:
         return {
             "type": "input_audio_buffer.committed",
             "previous_item_id": self._previous_item_id(item_id),
             "item_id": item_id,
-            "event": event,
         }
 
     def _session_create_from_realtime(self, session_payload: dict[str, object]) -> dict[str, object]:
