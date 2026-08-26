@@ -7,10 +7,12 @@ import base64
 import io
 import sys
 import wave
+from math import gcd
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy.signal import resample_poly
 
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexSession,
@@ -27,7 +29,7 @@ from vllm_omni.experimental.fullduplex.openai.server_vad import (
     SileroVADBackendProvider,
     SpeechEndpointDecision,
     ThresholdEndpointPolicy,
-    _PCM16Mono24kTo16kResampler,
+    _StreamingPCM16MonoResampler,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -67,80 +69,118 @@ def test_server_vad_config_defaults_and_validation():
         ServerVADConfig.from_value({"type": "server_vad", "semantic_eagerness": "high"})
 
 
-def _resample_24khz_reference(samples: np.ndarray) -> np.ndarray:
+def _resample_reference(
+    samples: np.ndarray,
+    *,
+    source_rate_hz: int = 24_000,
+    target_rate_hz: int = 16_000,
+) -> np.ndarray:
     normalized = samples.astype(np.float32) * np.float32(1.0 / 32768.0)
-    taps = _PCM16Mono24kTo16kResampler._design_lowpass()
-    history = np.zeros(taps.size - 1, dtype=np.float32)
-    filtered = np.convolve(np.concatenate((history, normalized)), taps, mode="valid").astype(
-        np.float32,
-        copy=False,
+    rate_gcd = gcd(source_rate_hz, target_rate_hz)
+    return np.ascontiguousarray(
+        resample_poly(
+            normalized,
+            target_rate_hz // rate_gcd,
+            source_rate_hz // rate_gcd,
+        ),
+        dtype=np.float32,
     )
-    complete_samples = filtered.size - filtered.size % 3
-    triplets = filtered[:complete_samples].reshape(-1, 3)
-    expected = np.empty(triplets.shape[0] * 2, dtype=np.float32)
-    expected[0::2] = triplets[:, 0]
-    expected[1::2] = (triplets[:, 1] + triplets[:, 2]) * np.float32(0.5)
-    return expected
+
+
+def test_streaming_pcm16_resampler_binds_source_and_target_rates():
+    resampler = _StreamingPCM16MonoResampler(source_rate_hz=24_000, target_rate_hz=16_000)
+
+    assert resampler.source_rate_hz == 24_000
+    assert resampler.target_rate_hz == 16_000
+
+    for invalid_rate in (True, 0, -1):
+        with pytest.raises(ValueError, match="positive integer"):
+            _StreamingPCM16MonoResampler(source_rate_hz=invalid_rate, target_rate_hz=16_000)
+
+
+@pytest.mark.parametrize("source_rate_hz", [8_000, 24_000, 44_100, 48_000])
+@pytest.mark.parametrize("sample_count", [1, 2, 3, 4, 5, 17, 2_399, 2_400, 2_401])
+def test_streaming_pcm16_resampler_matches_resample_poly(source_rate_hz: int, sample_count: int):
+    rng = np.random.default_rng(sample_count)
+    source = rng.integers(-32_768, 32_768, size=sample_count, dtype=np.int16)
+    resampler = _StreamingPCM16MonoResampler(
+        source_rate_hz=source_rate_hz,
+        target_rate_hz=16_000,
+    )
+
+    actual = np.concatenate((resampler.push(source), resampler.flush()))
+    expected = _resample_reference(source, source_rate_hz=source_rate_hz)
+
+    assert actual.size == (sample_count * 16_000 + source_rate_hz - 1) // source_rate_hz
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+    assert resampler.pending_samples == 0
+    assert resampler.scratch_bytes == 0
 
 
 @pytest.mark.parametrize(
     "chunk_sizes",
     [
-        [2_400],
-        [1] * 2_400,
-        [2, 1] * 800,
-        [7, 13, 511, 512, 513, 844],
+        [2_401],
+        [1] * 2_401,
+        [2, 1] * 800 + [1],
+        [7, 13, 511, 512, 513, 845],
     ],
 )
 def test_24khz_resampler_is_invariant_to_chunk_boundaries(chunk_sizes: list[int]):
-    sample_index = np.arange(2_400, dtype=np.int32)
+    sample_index = np.arange(2_401, dtype=np.int32)
     source = ((sample_index * 7919) % 65_536 - 32_768).astype("<i2")
-    resampler = _PCM16Mono24kTo16kResampler()
+    resampler = _StreamingPCM16MonoResampler(source_rate_hz=24_000)
 
     chunks: list[np.ndarray] = []
     offset = 0
     for chunk_size in chunk_sizes:
         chunks.append(resampler.push(source[offset : offset + chunk_size]))
+        chunks.append(resampler.push(source[:0]))
         offset += chunk_size
 
     assert offset == source.size
+    chunks.append(resampler.flush())
     actual = np.concatenate(chunks)
-    expected = _resample_24khz_reference(source)
-    np.testing.assert_array_equal(actual, expected)
-    assert actual.size == 1_600
+    whole_resampler = _StreamingPCM16MonoResampler(source_rate_hz=24_000)
+    whole = np.concatenate((whole_resampler.push(source), whole_resampler.flush()))
+    expected = _resample_reference(source)
+    np.testing.assert_array_equal(actual, whole)
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+    assert actual.size == 1_601
     assert resampler.pending_samples == 0
 
 
-def test_24khz_resampler_retains_incomplete_triplet():
-    source = np.asarray([-32768, 12_000, 20_000], dtype="<i2")
-    resampler = _PCM16Mono24kTo16kResampler()
+def test_24khz_resampler_retains_right_lookahead_until_flush():
+    source = np.arange(15, dtype="<i2")
+    resampler = _StreamingPCM16MonoResampler(source_rate_hz=24_000)
 
-    assert resampler.push(source[:1]).size == 0
-    assert resampler.pending_samples == 1
-    assert resampler.scratch_bytes == 4
-    assert resampler.push(source[1:2]).size == 0
-    assert resampler.pending_samples == 2
-    assert resampler.scratch_bytes == 8
+    assert resampler.push(source).size == 0
+    assert resampler.pending_samples == 10
+    assert resampler.scratch_bytes == 40
 
-    actual = resampler.push(source[2:])
+    actual = resampler.flush()
 
-    np.testing.assert_array_equal(actual, _resample_24khz_reference(source))
+    np.testing.assert_allclose(actual, _resample_reference(source), rtol=2e-5, atol=2e-5)
     assert resampler.pending_samples == 0
     assert resampler.scratch_bytes == 0
 
+    assert resampler.flush().size == 0
+    with pytest.raises(RuntimeError, match="has been flushed"):
+        resampler.push(source)
+
 
 def test_24khz_resampler_reset_discards_residual_samples():
-    resampler = _PCM16Mono24kTo16kResampler()
-    discarded = np.asarray([30_000, -30_000], dtype="<i2")
-    source = np.asarray([-32768, 0, 32767], dtype="<i2")
+    resampler = _StreamingPCM16MonoResampler(source_rate_hz=24_000)
+    discarded = np.arange(23, dtype="<i2")
+    source = np.arange(64, dtype="<i2")
 
-    assert resampler.push(discarded).size == 0
-    assert resampler.pending_samples == 2
+    resampler.push(discarded)
+    assert resampler.pending_samples > 0
     resampler.reset()
 
-    actual = resampler.push(source)
+    actual = np.concatenate((resampler.push(source), resampler.flush()))
 
-    np.testing.assert_array_equal(actual, _resample_24khz_reference(source))
+    np.testing.assert_allclose(actual, _resample_reference(source), rtol=2e-5, atol=2e-5)
     assert resampler.pending_samples == 0
 
 
@@ -148,14 +188,40 @@ def test_24khz_resampler_suppresses_content_above_16khz_nyquist():
     sample_rate_hz = 24_000
     sample_index = np.arange(sample_rate_hz, dtype=np.float64)
     source = np.rint(0.8 * 32767 * np.sin(2 * np.pi * 10_000 * sample_index / sample_rate_hz)).astype("<i2")
-    resampler = _PCM16Mono24kTo16kResampler()
+    resampler = _StreamingPCM16MonoResampler(source_rate_hz=24_000)
 
-    output = resampler.push(source)
+    output = np.concatenate((resampler.push(source), resampler.flush()))
 
-    # Ignore the short causal FIR startup transient. A non-filtered 3:2
+    # Ignore the short finite-stream edge transient. A non-filtered 3:2
     # converter aliases this tone into the output at roughly 0.4 RMS.
     steady_state_rms = float(np.sqrt(np.mean(np.square(output[1_000:]))))
     assert steady_state_rms < 0.005
+
+
+def test_24khz_resampler_does_not_create_a_passband_image():
+    source_rate_hz = 24_000
+    target_rate_hz = 16_000
+    frequency_hz = 6_000
+    sample_index = np.arange(source_rate_hz * 2, dtype=np.float64)
+    source = np.rint(0.8 * 32767 * np.sin(2 * np.pi * frequency_hz * sample_index / source_rate_hz)).astype("<i2")
+    resampler = _StreamingPCM16MonoResampler(
+        source_rate_hz=source_rate_hz,
+        target_rate_hz=target_rate_hz,
+    )
+
+    output = np.concatenate((resampler.push(source), resampler.flush()))[8_000:24_000]
+
+    def amplitude_at(frequency: int) -> float:
+        basis = np.exp(-2j * np.pi * frequency * np.arange(output.size) / target_rate_hz)
+        return float(2 * np.abs(np.dot(output, basis)) / output.size)
+
+    desired_amplitude = amplitude_at(frequency_hz)
+    image_amplitude = amplitude_at(target_rate_hz // 2 - frequency_hz)
+    desired_gain_db = 20 * np.log10(desired_amplitude / 0.8)
+    image_db = 20 * np.log10(image_amplitude / desired_amplitude)
+
+    assert abs(desired_gain_db) < 0.1
+    assert image_db < -60
 
 
 @pytest.mark.asyncio
@@ -188,6 +254,8 @@ async def test_server_vad_pipeline_handles_arbitrary_chunk_boundaries():
 async def test_server_vad_pipeline_pcm16_resampling_is_split_invariant():
     sample_index = np.arange(2_400, dtype=np.int32)
     source = ((sample_index * 7919) % 65_536 - 32_768).astype("<i2")
+    right_context = np.zeros(18, dtype="<i2")
+    continuous_source = np.concatenate((source, right_context))
 
     async def process(chunk_sizes: list[int], *, use_bytes: bool) -> tuple[np.ndarray, list[SpeechEndpointDecision]]:
         pipeline = ServerVADPipeline(
@@ -197,24 +265,49 @@ async def test_server_vad_pipeline_pcm16_resampling_is_split_invariant():
         frames: list[ServerVADFrame] = []
         offset = 0
         for chunk_size in chunk_sizes:
-            chunk = source[offset : offset + chunk_size]
+            chunk = continuous_source[offset : offset + chunk_size]
             payload = chunk.tobytes() if use_bytes else chunk
             batch = await pipeline.push_pcm16(payload, source_sample_rate_hz=24_000)
             frames.extend(batch.frames)
             offset += chunk_size
-        assert offset == source.size
-        assert pipeline.scratch_bytes == 0
+        assert offset == continuous_source.size
+        assert pipeline.scratch_bytes > 0
         return np.concatenate([frame.samples for frame in frames]), [frame.decision for frame in frames]
 
-    whole_samples, whole_decisions = await process([2_400], use_bytes=False)
+    whole_samples, whole_decisions = await process([2_418], use_bytes=False)
     split_samples, split_decisions = await process(
-        [7, 13, 511, 512, 513, 844],
+        [7, 13, 511, 512, 513, 862],
         use_bytes=True,
     )
 
     np.testing.assert_array_equal(split_samples, whole_samples)
-    np.testing.assert_array_equal(whole_samples, _resample_24khz_reference(source))
+    np.testing.assert_allclose(whole_samples, _resample_reference(source), rtol=2e-5, atol=2e-5)
     assert split_decisions == whole_decisions
+
+
+@pytest.mark.asyncio
+async def test_server_vad_pipeline_binds_source_rate_on_first_nonempty_append():
+    pipeline = ServerVADPipeline(
+        SequenceDetector([0.0]),
+        ServerVADConfig(),
+    )
+
+    assert pipeline.source_sample_rate_hz is None
+    assert pipeline._input_resampler is None
+    assert pipeline.scratch_bytes == 0
+
+    empty_batch = await pipeline.push_pcm16(b"", source_sample_rate_hz=24_000)
+
+    assert not empty_batch.frames
+    assert pipeline.source_sample_rate_hz is None
+    assert pipeline._input_resampler is None
+    assert pipeline.scratch_bytes == 0
+
+    await pipeline.push_pcm16(np.asarray([1], dtype="<i2"), source_sample_rate_hz=16_000)
+
+    assert pipeline.source_sample_rate_hz == 16_000
+    assert pipeline._input_resampler is None
+    assert pipeline.scratch_bytes == np.dtype(np.float32).itemsize
 
 
 @pytest.mark.asyncio
@@ -224,11 +317,17 @@ async def test_server_vad_pipeline_reset_clears_resampler_and_source_rate_lock()
         ServerVADConfig(),
     )
 
+    assert pipeline._input_resampler is None
     batch = await pipeline.push_pcm16(np.asarray([30_000, -30_000], dtype="<i2"), source_sample_rate_hz=24_000)
     assert not batch.frames
+    assert pipeline._input_resampler is not None
+    assert pipeline._input_resampler.source_rate_hz == 24_000
+    assert pipeline._input_resampler.target_rate_hz == pipeline.sample_rate_hz
     assert pipeline.scratch_bytes == 8
 
     pipeline.reset()
+    assert pipeline.source_sample_rate_hz is None
+    assert pipeline._input_resampler is None
     assert pipeline.scratch_bytes == 0
 
     source = np.zeros(160, dtype="<i2")
@@ -236,6 +335,8 @@ async def test_server_vad_pipeline_reset_clears_resampler_and_source_rate_lock()
     batch = await pipeline.push_pcm16(source.tobytes(), source_sample_rate_hz=16_000)
 
     assert len(batch.frames) == 1
+    assert pipeline.source_sample_rate_hz == 16_000
+    assert pipeline._input_resampler is None
     np.testing.assert_array_equal(
         batch.frames[0].samples[:3],
         np.asarray([-1.0, 0.0, 32767 / 32768], dtype=np.float32),

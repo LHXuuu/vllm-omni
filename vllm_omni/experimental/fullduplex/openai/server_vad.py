@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -135,79 +136,156 @@ class SpeechEndpointPolicy(Protocol):
     def reset(self) -> None: ...
 
 
-class _PCM16Mono24kTo16kResampler:
-    """Stateful anti-aliased 3:2 resampler for chunked mono PCM16 input.
+class _StreamingPCM16MonoResampler:
+    """Polyphase resampler for a continuous chunked mono PCM16 stream.
 
-    A causal windowed-sinc FIR first removes content above the 16 kHz
-    Nyquist limit. The filtered stream is then sampled on the 16 kHz output
-    grid at source positions ``0, 1.5, 3, 4.5, ...``. Retaining the FIR
-    history and the final zero to two filtered samples makes the result
-    invariant to arbitrary WebSocket chunk boundaries.
+    The symmetric Kaiser-windowed sinc filter matches the default filter used
+    by ``scipy.signal.resample_poly`` without adding SciPy as a serving
+    dependency. ``push`` emits only samples whose right-hand filter support is
+    available, so output is invariant to arbitrary WebSocket chunking. The
+    resulting lookahead is 0.625 ms for 24 kHz to 16 kHz conversion.
 
-    Output is normalized float32 PCM. ``reset`` intentionally drops any
-    incomplete source group and filter history; callers use it when the input
-    buffer is cleared.
+    ``flush`` supplies the right-edge zero padding required by a finite input
+    stream. A Realtime session remains continuous across speech turns and
+    therefore does not flush at VAD endpoints; ``reset`` intentionally drops
+    the buffered tail when the input buffer is cleared.
     """
 
-    source_sample_rate_hz = 24_000
-    target_sample_rate_hz = 16_000
-    _filter_taps = 63
-    _filter_cutoff_hz = 7_400
+    _half_filter_width = 10
+    _kaiser_beta = 5.0
 
-    @classmethod
-    def _design_lowpass(cls) -> np.ndarray:
-        # A Hamming-windowed sinc gives a compact, deterministic filter with
-        # strong rejection above 8 kHz without adding a runtime dependency.
-        center = (cls._filter_taps - 1) / 2
-        offsets = np.arange(cls._filter_taps, dtype=np.float64) - center
-        normalized_cutoff = cls._filter_cutoff_hz / cls.source_sample_rate_hz
-        taps = 2 * normalized_cutoff * np.sinc(2 * normalized_cutoff * offsets)
-        taps *= np.hamming(cls._filter_taps)
+    def __init__(self, *, source_rate_hz: int, target_rate_hz: int = 16_000) -> None:
+        if isinstance(source_rate_hz, bool) or not isinstance(source_rate_hz, int) or source_rate_hz <= 0:
+            raise ValueError("source_rate_hz must be a positive integer")
+        if isinstance(target_rate_hz, bool) or not isinstance(target_rate_hz, int) or target_rate_hz <= 0:
+            raise ValueError("target_rate_hz must be a positive integer")
+        self.source_rate_hz = source_rate_hz
+        self.target_rate_hz = target_rate_hz
+        rate_gcd = math.gcd(source_rate_hz, target_rate_hz)
+        self._up = target_rate_hz // rate_gcd
+        self._down = source_rate_hz // rate_gcd
+        self._half_len, self._phase_kernels = self._design_polyphase_filter()
+        self._history_samples = self._phase_kernels.shape[1] - 1
+        self._history = np.zeros(self._history_samples, dtype=np.float32)
+        self._input_samples = 0
+        self._output_samples = 0
+        self._flushed = False
+
+    def _design_polyphase_filter(self) -> tuple[int, np.ndarray]:
+        if self._up == self._down:
+            return 0, np.ones((1, 1), dtype=np.float32)
+
+        max_rate = max(self._up, self._down)
+        half_len = self._half_filter_width * max_rate
+        offsets = np.arange(-half_len, half_len + 1, dtype=np.float64)
+        cutoff = 1.0 / max_rate
+        taps = cutoff * np.sinc(cutoff * offsets)
+        taps *= np.kaiser(taps.size, self._kaiser_beta)
         taps /= np.sum(taps)
-        return np.ascontiguousarray(taps, dtype=np.float32)
+        taps *= self._up
+        taps = np.ascontiguousarray(taps, dtype=np.float32)
 
-    def __init__(self) -> None:
-        self._lowpass = self._design_lowpass()
-        self._filter_history = np.zeros(self._filter_taps - 1, dtype=np.float32)
-        self._pending = np.empty(0, dtype=np.float32)
+        phases = [taps[phase :: self._up] for phase in range(self._up)]
+        phase_width = max(phase.size for phase in phases)
+        kernels = np.zeros((self._up, phase_width), dtype=np.float32)
+        for phase_index, phase in enumerate(phases):
+            kernels[phase_index, -phase.size :] = phase[::-1]
+        return half_len, kernels
 
     @property
     def pending_samples(self) -> int:
-        return int(self._pending.size)
+        total_output_samples = self._ceil_div(self._input_samples * self._up, self._down)
+        return max(0, total_output_samples - self._output_samples)
 
     @property
     def scratch_bytes(self) -> int:
-        return int(self._pending.nbytes)
+        return self.pending_samples * np.dtype(np.float32).itemsize
+
+    @staticmethod
+    def _ceil_div(numerator: int, denominator: int) -> int:
+        return -(-numerator // denominator)
+
+    def _render_outputs(
+        self,
+        combined: np.ndarray,
+        *,
+        first_output: int,
+        output_count: int,
+        input_start: int,
+    ) -> np.ndarray:
+        if output_count <= 0:
+            return np.empty(0, dtype=np.float32)
+
+        output_indexes = np.arange(first_output, first_output + output_count, dtype=np.int64)
+        filter_indexes = output_indexes * self._down + self._half_len
+        source_indexes = filter_indexes // self._up
+        phases = filter_indexes % self._up
+        windows = np.lib.stride_tricks.sliding_window_view(
+            combined,
+            self._phase_kernels.shape[1],
+        )
+        selected_windows = windows[source_indexes - input_start]
+        return np.sum(
+            selected_windows * self._phase_kernels[phases],
+            axis=1,
+            dtype=np.float32,
+        )
 
     def push(self, samples: np.ndarray) -> np.ndarray:
+        if self._flushed:
+            raise RuntimeError("cannot push audio after the resampler has been flushed; call reset first")
+
         pcm16 = np.ascontiguousarray(samples, dtype="<i2").reshape(-1)
         if pcm16.size == 0:
             return np.empty(0, dtype=np.float32)
 
         source = pcm16.astype(np.float32) * np.float32(1.0 / 32768.0)
-        filter_input = np.concatenate((self._filter_history, source))
-        filtered = np.convolve(filter_input, self._lowpass, mode="valid").astype(np.float32, copy=False)
-        self._filter_history = np.ascontiguousarray(
-            filter_input[-(self._filter_taps - 1) :],
-            dtype=np.float32,
+        combined = np.concatenate((self._history, source))
+        next_input_samples = self._input_samples + source.size
+        stable_output_samples = max(
+            0,
+            self._ceil_div(next_input_samples * self._up - self._half_len, self._down),
         )
-        if self._pending.size:
-            filtered = np.concatenate((self._pending, filtered))
+        output = self._render_outputs(
+            combined,
+            first_output=self._output_samples,
+            output_count=stable_output_samples - self._output_samples,
+            input_start=self._input_samples,
+        )
+        if self._history_samples:
+            self._history = np.ascontiguousarray(combined[-self._history_samples :], dtype=np.float32)
+        self._input_samples = next_input_samples
+        self._output_samples = stable_output_samples
+        return output
 
-        complete_samples = filtered.size - filtered.size % 3
-        self._pending = np.array(filtered[complete_samples:], dtype=np.float32, copy=True)
-        if complete_samples == 0:
+    def flush(self) -> np.ndarray:
+        if self._flushed:
             return np.empty(0, dtype=np.float32)
 
-        triplets = filtered[:complete_samples].reshape(-1, 3)
-        output = np.empty(triplets.shape[0] * 2, dtype=np.float32)
-        output[0::2] = triplets[:, 0]
-        output[1::2] = (triplets[:, 1] + triplets[:, 2]) * np.float32(0.5)
+        total_output_samples = self._ceil_div(self._input_samples * self._up, self._down)
+        output_count = total_output_samples - self._output_samples
+        if output_count:
+            last_output = total_output_samples - 1
+            last_source_index = (last_output * self._down + self._half_len) // self._up
+            right_padding = max(0, last_source_index - self._input_samples + 1)
+            combined = np.concatenate((self._history, np.zeros(right_padding, dtype=np.float32)))
+            output = self._render_outputs(
+                combined,
+                first_output=self._output_samples,
+                output_count=output_count,
+                input_start=self._input_samples,
+            )
+        else:
+            output = np.empty(0, dtype=np.float32)
+        self._output_samples = total_output_samples
+        self._flushed = True
         return output
 
     def reset(self) -> None:
-        self._filter_history = np.zeros(self._filter_taps - 1, dtype=np.float32)
-        self._pending = np.empty(0, dtype=np.float32)
+        self._history = np.zeros(self._history_samples, dtype=np.float32)
+        self._input_samples = 0
+        self._output_samples = 0
+        self._flushed = False
 
 
 class ThresholdEndpointPolicy:
@@ -312,7 +390,7 @@ class ServerVADPipeline:
             config,
             sample_rate_hz=self.sample_rate_hz,
         )
-        self._input_resampler = _PCM16Mono24kTo16kResampler()
+        self._input_resampler: _StreamingPCM16MonoResampler | None = None
         self._source_sample_rate_hz: int | None = None
         self._scratch = np.empty(0, dtype=np.float32)
         self._detector_state = backend.new_state()
@@ -328,7 +406,8 @@ class ServerVADPipeline:
 
     @property
     def scratch_bytes(self) -> int:
-        return int(self._scratch.nbytes) + self._input_resampler.scratch_bytes
+        resampler_bytes = self._input_resampler.scratch_bytes if self._input_resampler is not None else 0
+        return int(self._scratch.nbytes) + resampler_bytes
 
     async def push_pcm16(
         self,
@@ -355,9 +434,18 @@ class ServerVADPipeline:
         if self._source_sample_rate_hz is not None and source_sample_rate_hz != self._source_sample_rate_hz:
             raise ValueError("server_vad input sample rate cannot change within a continuous audio stream")
         if pcm16.size and self._source_sample_rate_hz is None:
+            input_resampler = (
+                None
+                if source_sample_rate_hz == self.sample_rate_hz
+                else _StreamingPCM16MonoResampler(
+                    source_rate_hz=source_sample_rate_hz,
+                    target_rate_hz=self.sample_rate_hz,
+                )
+            )
             self._source_sample_rate_hz = source_sample_rate_hz
+            self._input_resampler = input_resampler
 
-        if source_sample_rate_hz == self._input_resampler.source_sample_rate_hz:
+        if self._input_resampler is not None:
             normalized = self._input_resampler.push(pcm16)
         else:
             normalized = np.ascontiguousarray(pcm16, dtype=np.float32) / np.float32(32768.0)
@@ -400,7 +488,7 @@ class ServerVADPipeline:
         )
 
     def reset(self, *, clear_timeline: bool = False) -> None:
-        self._input_resampler.reset()
+        self._input_resampler = None
         self._source_sample_rate_hz = None
         self._scratch = np.empty(0, dtype=np.float32)
         self._detector_state = self.backend.new_state()
