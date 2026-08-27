@@ -51,10 +51,10 @@ from vllm_omni.experimental.fullduplex.openai.runtime_bridge import (
     NativeRuntimeBridgeMixin,
 )
 from vllm_omni.experimental.fullduplex.openai.server_vad import (
-    ServerVADConfig,
     ServerVADPipeline,
     SileroVADBackendProvider,
     SpeechDetectorBackendProvider,
+    parse_session_turn_detection,
 )
 from vllm_omni.experimental.fullduplex.openai.session_attachment import (
     DuplexJournalGapError,
@@ -1514,11 +1514,8 @@ class OmniDuplexSessionHandler(
             NativeRealtimeSessionProtocol._json_safe_realtime_payload(payload)
         )
         try:
-            turn_detection_configured, turn_detection = NativeRealtimeSessionProtocol._realtime_turn_detection_value(
-                payload
-            )
+            turn_detection_configured, server_vad = parse_session_turn_detection(payload)
             if turn_detection_configured:
-                server_vad = None if turn_detection is None else ServerVADConfig.from_value(turn_detection)
                 if session.turn_detection_config_locked and (
                     not session.config.turn_detection_configured or server_vad != session.config.server_vad
                 ):

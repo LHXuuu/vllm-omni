@@ -34,6 +34,7 @@ from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     ServingRuntimeSessionState,
     payload_turn_id,
 )
+from vllm_omni.experimental.fullduplex.openai.server_vad import ServerVADPipeline
 from vllm_omni.experimental.fullduplex.openai.session_attachment import (
     DuplexJournalOverflowError,
 )
@@ -337,6 +338,39 @@ class DuplexSessionRunnerMixin:
             if isinstance(event_id, str) and event_id:
                 payload["event_id"] = event_id
             return payload
+
+        async def reject_and_clear_server_vad_input(
+            pipeline: ServerVADPipeline,
+            *,
+            code: str,
+            error: str,
+            metric_reason: str,
+            event_id: object,
+        ) -> None:
+            assert session is not None
+            session.cancel_pending_input()
+            pipeline.reset()
+            self._realtime_vad_metrics.error(
+                session.config.model or self._chat_service.model_config.model,
+                metric_reason,
+            )
+            await emit_event(
+                correlate_realtime_error(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "code": code,
+                        "error": error,
+                    },
+                    event_id,
+                )
+            )
+            await emit_event(
+                {
+                    "type": "input_audio_buffer.cleared",
+                    "session_id": session.session_id,
+                }
+            )
 
         async def commit_server_vad_turn(
             *,
@@ -1467,7 +1501,10 @@ class DuplexSessionRunnerMixin:
                                 raise ValueError(
                                     "server_vad input sample rate cannot change within a continuous audio stream"
                                 )
-                            raw_audio = base64.b64decode(audio, validate=True)
+                            try:
+                                raw_audio = base64.b64decode(audio, validate=True)
+                            except (binascii.Error, ValueError) as exc:
+                                raise ValueError("server_vad input audio must be valid base64-encoded PCM16") from exc
                             if len(raw_audio) % np.dtype("<i2").itemsize:
                                 raise ValueError("server_vad PCM16 input contains an incomplete sample")
                             source_samples = len(raw_audio) // np.dtype("<i2").itemsize
@@ -1479,6 +1516,7 @@ class DuplexSessionRunnerMixin:
                                         "session_id": session.session_id,
                                         "code": "bad_audio",
                                         "error": str(exc),
+                                        "param": "audio",
                                     },
                                     realtime_event_id,
                                 )
@@ -1495,31 +1533,13 @@ class DuplexSessionRunnerMixin:
                             reserved_bytes,
                             limit=self._duplex_session_config.max_pending_input_bytes_per_session,
                         ):
-                            session.cancel_pending_input()
-                            pipeline.reset()
-                            self._realtime_vad_metrics.error(
-                                session.config.model or self._chat_service.model_config.model,
-                                "input_backpressure",
+                            await reject_and_clear_server_vad_input(
+                                pipeline,
+                                code="input_backpressure",
+                                error="Server VAD input exceeds the per-session input limit",
+                                metric_reason="input_backpressure",
+                                event_id=realtime_event_id,
                             )
-                            await emit_event(
-                                correlate_realtime_error(
-                                    {
-                                        "type": "error",
-                                        "session_id": session.session_id,
-                                        "code": "input_backpressure",
-                                        "error": "Server VAD input exceeds the per-session input limit",
-                                    },
-                                    realtime_event_id,
-                                )
-                            )
-                            await emit_event(
-                                {
-                                    "type": "input_audio_buffer.cleared",
-                                    "session_id": session.session_id,
-                                }
-                            )
-                            if realtime_protocol is not None:
-                                realtime_protocol.clear_realtime_input_buffer_state()
                             continue
                         try:
                             vad_batch = await pipeline.push_pcm16(
@@ -1527,32 +1547,14 @@ class DuplexSessionRunnerMixin:
                                 source_sample_rate_hz=source_sample_rate_hz,
                             )
                         except Exception as exc:
-                            session.cancel_pending_input()
-                            pipeline.reset()
                             logger.exception("Server VAD inference failed: %s", exc)
-                            self._realtime_vad_metrics.error(
-                                session.config.model or self._chat_service.model_config.model,
-                                "inference",
+                            await reject_and_clear_server_vad_input(
+                                pipeline,
+                                code="server_vad_inference_failed",
+                                error=str(exc),
+                                metric_reason="inference",
+                                event_id=realtime_event_id,
                             )
-                            await emit_event(
-                                correlate_realtime_error(
-                                    {
-                                        "type": "error",
-                                        "session_id": session.session_id,
-                                        "code": "server_vad_inference_failed",
-                                        "error": str(exc),
-                                    },
-                                    realtime_event_id,
-                                )
-                            )
-                            await emit_event(
-                                {
-                                    "type": "input_audio_buffer.cleared",
-                                    "session_id": session.session_id,
-                                }
-                            )
-                            if realtime_protocol is not None:
-                                realtime_protocol.clear_realtime_input_buffer_state()
                             continue
                         retained_delta = (
                             sum(frame.samples.nbytes for frame in vad_batch.frames)

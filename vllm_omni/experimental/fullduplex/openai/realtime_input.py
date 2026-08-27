@@ -16,7 +16,7 @@ from vllm_omni.experimental.fullduplex.openai.realtime_state import (
     REALTIME_OUTPUT_AUDIO_FORMATS,
     realtime_default_sample_rate_hz,
 )
-from vllm_omni.experimental.fullduplex.openai.server_vad import ServerVADConfig
+from vllm_omni.experimental.fullduplex.openai.server_vad import parse_session_turn_detection
 
 
 class RealtimeInputTranslator:
@@ -84,7 +84,7 @@ class RealtimeInputTranslator:
                 )
                 return None
             try:
-                turn_detection_config = self._parse_realtime_turn_detection(session_payload)
+                turn_detection_configured, server_vad = parse_session_turn_detection(session_payload)
             except ValueError as exc:
                 await self._send_realtime_payload(
                     self._realtime_error_payload(
@@ -95,7 +95,7 @@ class RealtimeInputTranslator:
                     )
                 )
                 return None
-            turn_detection_configured, normalized_turn_detection = turn_detection_config
+            normalized_turn_detection = server_vad.as_dict() if server_vad is not None else None
             turn_detection_error = self._validate_realtime_turn_detection(
                 session_payload,
                 configured=turn_detection_configured,
@@ -305,31 +305,7 @@ class RealtimeInputTranslator:
                     )
                 )
                 return None
-            if self._turn_detection is not None:
-                if isinstance(audio, str) and audio:
-                    try:
-                        raw_pcm16 = base64.b64decode(audio, validate=True)
-                    except (binascii.Error, ValueError):
-                        await self._send_realtime_payload(
-                            self._realtime_error_payload(
-                                "bad_audio",
-                                "server_vad input audio must be valid base64-encoded PCM16",
-                                event_id=event.get("event_id"),
-                                param="audio",
-                            )
-                        )
-                        return None
-                    if len(raw_pcm16) % np.dtype("<i2").itemsize:
-                        await self._send_realtime_payload(
-                            self._realtime_error_payload(
-                                "bad_audio",
-                                "server_vad PCM16 input contains an incomplete sample",
-                                event_id=event.get("event_id"),
-                                param="audio",
-                            )
-                        )
-                        return None
-            else:
+            if self._turn_detection is None:
                 try:
                     audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
                         audio,
@@ -346,12 +322,6 @@ class RealtimeInputTranslator:
                         )
                     )
                     return None
-            has_audio_payload = isinstance(audio, str) and bool(audio)
-            looks_like_speech = (
-                has_audio_payload
-                if self._turn_detection is not None
-                else self._input_looks_like_speech(event, audio=audio, fmt=fmt)
-            )
             payload = {
                 "type": "input_audio_buffer.append",
                 "audio": audio,
@@ -376,17 +346,20 @@ class RealtimeInputTranslator:
                     return None
                 payload["video_frames"] = [frame for frame in video_frames if isinstance(frame, str) and frame]
             self._copy_realtime_input_hints(event, payload)
-            self._input_audio_buffer_has_audio = self._input_audio_buffer_has_audio or (
-                looks_like_speech and has_audio_payload
-            )
-            self._input_audio_buffer_had_non_speech = self._input_audio_buffer_had_non_speech or (
-                not looks_like_speech and has_audio_payload
-            )
-            if looks_like_speech and self._turn_detection is None:
-                await self._emit_input_speech_started(event)
-                self._remember_input_transcript_hint(event)
-            if not looks_like_speech and self._turn_detection is None:
-                payload["is_speech"] = False
+            if self._turn_detection is None:
+                has_audio_payload = isinstance(audio, str) and bool(audio)
+                looks_like_speech = self._input_looks_like_speech(event, audio=audio, fmt=fmt)
+                self._input_audio_buffer_has_audio = self._input_audio_buffer_has_audio or (
+                    looks_like_speech and has_audio_payload
+                )
+                self._input_audio_buffer_had_non_speech = self._input_audio_buffer_had_non_speech or (
+                    not looks_like_speech and has_audio_payload
+                )
+                if looks_like_speech:
+                    await self._emit_input_speech_started(event)
+                    self._remember_input_transcript_hint(event)
+                else:
+                    payload["is_speech"] = False
             return payload
         if event_type == "input_audio_buffer.commit":
             if self._turn_detection is not None:
@@ -1086,36 +1059,6 @@ class RealtimeInputTranslator:
                 return "video_frames entries must be JPEG or PNG images"
         return None
 
-    @classmethod
-    def _realtime_turn_detection_value(
-        cls,
-        session_payload: dict[str, object],
-    ) -> tuple[bool, dict[str, object] | None]:
-        configured_values: list[tuple[str, object]] = []
-        if "turn_detection" in session_payload:
-            configured_values.append(("turn_detection", session_payload["turn_detection"]))
-        audio_config = session_payload.get("audio")
-        if isinstance(audio_config, dict):
-            audio_input = audio_config.get("input")
-            if isinstance(audio_input, dict) and "turn_detection" in audio_input:
-                configured_values.append(("audio.input.turn_detection", audio_input["turn_detection"]))
-        if not configured_values:
-            return False, None
-        first_path, first_value = configured_values[0]
-        first_normalized = None if first_value is None else ServerVADConfig.from_value(first_value).as_dict()
-        for field_path, value in configured_values[1:]:
-            normalized = None if value is None else ServerVADConfig.from_value(value).as_dict()
-            if normalized != first_normalized:
-                raise ValueError(f"{first_path} and {field_path} must not specify conflicting values")
-        return True, first_normalized
-
-    @classmethod
-    def _parse_realtime_turn_detection(
-        cls,
-        session_payload: dict[str, object],
-    ) -> tuple[bool, dict[str, object] | None]:
-        return cls._realtime_turn_detection_value(session_payload)
-
     def _validate_realtime_turn_detection(
         self,
         session_payload: dict[str, object],
@@ -1165,16 +1108,12 @@ class RealtimeInputTranslator:
 
     def commit_realtime_session_update(self, session_payload: dict[str, object]) -> None:
         """Apply protocol state only after Serving accepts a session update."""
-        configured, normalized = self._parse_realtime_turn_detection(session_payload)
+        configured, server_vad = parse_session_turn_detection(session_payload)
         self._apply_realtime_turn_detection(
             configured=configured,
-            normalized=normalized,
+            normalized=server_vad.as_dict() if server_vad is not None else None,
         )
         self._apply_realtime_session_defaults(session_payload)
-
-    def clear_realtime_input_buffer_state(self) -> None:
-        """Synchronize protocol input state after Serving discards the buffer."""
-        self._reset_realtime_input_buffer_state()
 
     @staticmethod
     def _input_audio_transcription_config(session_payload: dict[str, object]) -> dict[str, object] | None:

@@ -1247,6 +1247,42 @@ async def test_realtime_server_vad_locks_turn_detection_after_audio_append():
     assert "turn_detection cannot be changed after the first audio append" in error["message"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "audio",
+    ["not-base64", base64.b64encode(b"\x00").decode()],
+    ids=["invalid-base64", "incomplete-pcm16-sample"],
+)
+async def test_realtime_invalid_server_vad_audio_is_correlated_and_unbuffered(audio: str):
+    ws = TimedWebSocket()
+    ws.put(_server_vad_session_update(_server_vad_turn_detection(create_response=False)))
+    ws.put(
+        {
+            "type": "input_audio_buffer.append",
+            "event_id": "event-invalid-server-vad-audio",
+            "audio": audio,
+            "format": "pcm16",
+            "sample_rate_hz": 16_000,
+        }
+    )
+    ws.put(_server_vad_session_update(None))
+    ws.put({"type": "input_audio_buffer.commit", "event_id": "event-commit-after-invalid-audio"})
+    ws.put({"type": "session.close"})
+    handler = OmniDuplexSessionHandler(
+        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
+        server_vad_backend_provider=FakeServerVADProvider(FakeServerVADBackend([])),
+    )
+
+    await handler.handle_realtime_session(ws)  # type: ignore[arg-type]
+
+    errors = [event["error"] for event in ws.sent if event.get("type") == "error"]
+    bad_audio = next(error for error in errors if error["code"] == "bad_audio")
+    assert bad_audio["event_id"] == "event-invalid-server-vad-audio"
+    assert bad_audio["param"] == "audio"
+    empty_buffer = next(error for error in errors if error["code"] == "input_audio_buffer_empty")
+    assert empty_buffer["event_id"] == "event-commit-after-invalid-audio"
+
+
 def test_native_realtime_protocol_response_done_does_not_reorder_conversation_tail():
     protocol = NativeRealtimeSessionProtocol(TimedWebSocket())  # type: ignore[arg-type]
 

@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
@@ -97,6 +98,30 @@ class ServerVADConfig:
             "create_response": self.create_response,
             "interrupt_response": self.interrupt_response,
         }
+
+
+def parse_session_turn_detection(
+    payload: Mapping[str, object],
+) -> tuple[bool, ServerVADConfig | None]:
+    """Extract and validate OpenAI-compatible turn detection aliases."""
+    configured_values: list[tuple[str, object]] = []
+    if "turn_detection" in payload:
+        configured_values.append(("turn_detection", payload["turn_detection"]))
+    audio = payload.get("audio")
+    if isinstance(audio, Mapping):
+        audio_input = audio.get("input")
+        if isinstance(audio_input, Mapping) and "turn_detection" in audio_input:
+            configured_values.append(("audio.input.turn_detection", audio_input["turn_detection"]))
+    if not configured_values:
+        return False, None
+
+    first_path, first_value = configured_values[0]
+    first_config = None if first_value is None else ServerVADConfig.from_value(first_value)
+    for field_path, value in configured_values[1:]:
+        config = None if value is None else ServerVADConfig.from_value(value)
+        if config != first_config:
+            raise ValueError(f"{first_path} and {field_path} must not specify conflicting values")
+    return True, first_config
 
 
 class SpeechDetectorBackend(Protocol):

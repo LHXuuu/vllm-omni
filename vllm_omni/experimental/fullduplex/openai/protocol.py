@@ -14,18 +14,8 @@ from vllm_omni.experimental.fullduplex.openai.audio import (
 )
 from vllm_omni.experimental.fullduplex.openai.server_vad import (
     ServerVADConfig,
+    parse_session_turn_detection,
 )
-
-
-def _turn_detection_value(payload: Mapping[str, object]) -> tuple[bool, object]:
-    if "turn_detection" in payload:
-        return True, payload["turn_detection"]
-    audio = payload.get("audio")
-    if isinstance(audio, Mapping):
-        audio_input = audio.get("input")
-        if isinstance(audio_input, Mapping) and "turn_detection" in audio_input:
-            return True, audio_input["turn_detection"]
-    return False, None
 
 
 class DuplexOverlapPolicy(str, Enum):
@@ -330,13 +320,13 @@ class DuplexSessionConfig:
             config.playback_commit_policy = cls._normalize_playback_commit_policy(source["playback_commit_policy"])
         if isinstance(source.get("modalities"), list) and all(isinstance(x, str) for x in source["modalities"]):
             config.modalities = list(source["modalities"])
-        turn_detection_configured, turn_detection = _turn_detection_value(source)
+        turn_detection_configured, server_vad = parse_session_turn_detection(source)
         if isinstance(source.get("extra_body"), dict):
             config.extra_body = dict(source["extra_body"])
             extra = config.extra_body
             raw_realtime_session = extra.get("realtime_session_payload")
             if not turn_detection_configured and isinstance(raw_realtime_session, dict):
-                turn_detection_configured, turn_detection = _turn_detection_value(raw_realtime_session)
+                turn_detection_configured, server_vad = parse_session_turn_detection(raw_realtime_session)
             if isinstance(extra.get("overlap_policy"), str):
                 config.overlap_policy = cls._normalize_overlap_policy(extra["overlap_policy"])
             if isinstance(extra.get("overlap_short_ack_ms"), int | float):
@@ -349,8 +339,7 @@ class DuplexSessionConfig:
                 config.playback_commit_policy = cls._normalize_playback_commit_policy(extra["playback_commit_policy"])
         if turn_detection_configured:
             config.turn_detection_configured = True
-            if turn_detection is not None:
-                config.server_vad = ServerVADConfig.from_value(turn_detection)
+            config.server_vad = server_vad
         return config
 
     @staticmethod
