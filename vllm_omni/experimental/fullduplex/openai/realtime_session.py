@@ -13,10 +13,6 @@ from vllm_omni.experimental.fullduplex.openai.realtime_input import (
 from vllm_omni.experimental.fullduplex.openai.realtime_output import (
     RealtimeOutputProjector,
 )
-from vllm_omni.experimental.fullduplex.openai.realtime_trace import (
-    trace_realtime_event,
-)
-
 REALTIME_ERROR_TYPES_BY_CODE = _state.REALTIME_ERROR_TYPES_BY_CODE
 REALTIME_INPUT_AUDIO_FORMATS = _state.REALTIME_INPUT_AUDIO_FORMATS
 REALTIME_OUTPUT_AUDIO_FORMATS = _state.REALTIME_OUTPUT_AUDIO_FORMATS
@@ -68,12 +64,6 @@ class NativeRealtimeSessionProtocol(
                 return raw
             if not isinstance(event, dict):
                 return raw
-            trace_realtime_event(
-                "websocket",
-                "client_event",
-                event,
-                session_id=self._default_session_id if isinstance(self._default_session_id, str) else None,
-            )
             if not self._opened and event.get("type") == "session.resume":
                 self._opened = True
                 translated = await self._to_duplex_event(event)

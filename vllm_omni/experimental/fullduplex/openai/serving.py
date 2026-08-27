@@ -39,10 +39,6 @@ from vllm_omni.experimental.fullduplex.openai.realtime_session import (
     REALTIME_OUTPUT_AUDIO_FORMATS,
     NativeRealtimeSessionProtocol,
 )
-from vllm_omni.experimental.fullduplex.openai.realtime_trace import (
-    log_realtime_trace_configuration,
-    trace_realtime_action,
-)
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     ServingRuntimeAdapter,
     ServingRuntimeConfigError,
@@ -123,7 +119,6 @@ class OmniDuplexSessionHandler(
         self._config_timeout_s = config_timeout_s
         self._idle_timeout_s = idle_timeout_s
         self._duplex_session_config = duplex_session_config or DuplexSessionRuntimeConfig()
-        log_realtime_trace_configuration()
         self._server_vad_backend_provider = server_vad_backend_provider or SileroVADBackendProvider(
             model_path=self._duplex_session_config.server_vad_model_path,
         )
@@ -1560,28 +1555,11 @@ class OmniDuplexSessionHandler(
         if previous_model is not None:
             self._realtime_vad_metrics.session_finished(previous_model)
         if pipeline is None:
-            trace_realtime_action(
-                "server_vad",
-                "pipeline_disabled",
-                session_id=session.session_id,
-            )
             return
         self._server_vad_pipelines[session.session_id] = pipeline
         model_name = session.config.model or self._chat_service.model_config.model
         self._server_vad_metric_models[session.session_id] = model_name
         self._realtime_vad_metrics.session_started(model_name)
-        trace_realtime_action(
-            "server_vad",
-            "pipeline_installed",
-            session_id=session.session_id,
-            backend=type(pipeline.backend).__name__,
-            sample_rate_hz=pipeline.sample_rate_hz,
-            frame_samples=pipeline.backend.frame_samples,
-            threshold=pipeline.config.threshold,
-            prefix_padding_ms=pipeline.config.prefix_padding_ms,
-            silence_duration_ms=pipeline.config.silence_duration_ms,
-            create_response=pipeline.config.create_response,
-        )
 
     async def _prepare_server_vad_pipeline(
         self,
@@ -1592,21 +1570,7 @@ class OmniDuplexSessionHandler(
             return None
         if self._uses_native_input_append(session):
             raise RuntimeError(self._unsupported_native_server_vad_error()["error"])
-        trace_realtime_action(
-            "server_vad",
-            "backend_resolving",
-            session_id=session.session_id,
-        )
         backend = await asyncio.to_thread(self._server_vad_backend_provider.get)
-        trace_realtime_action(
-            "server_vad",
-            "backend_ready",
-            session_id=session.session_id,
-            backend=type(backend).__name__,
-            sample_rate_hz=getattr(backend, "sample_rate_hz", None),
-            frame_samples=backend.frame_samples,
-            model_path=str(getattr(backend, "model_path", "")) or None,
-        )
         return ServerVADPipeline(backend, config.server_vad)
 
     def _apply_response_create_options(

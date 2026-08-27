@@ -312,22 +312,6 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
 For a duplex deployment, bare `/v1/realtime` selects the duplex serving stack. The client uses its explicit legacy
 opt-out only for the existing non-Server-VAD wire flow; `?duplex=1` remains a supported compatibility alias.
 
-To trace the Realtime serving path without logging audio or text payloads, enable lifecycle tracing when starting the
-server:
-
-```bash
-VLLM_LOGGING_LEVEL=DEBUG \
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
-  --omni \
-  --port 8091 \
-  --deploy-config /path/to/qwen3_omni_server_vad.yaml
-```
-
-Trace lines use the `[RealtimeTrace]` marker and cover WebSocket events, protocol translation, VAD initialization and
-boundaries, Turn commits, chat fallback inference, and Response completion. They are standard DEBUG logs and are not
-emitted at the default log level. DEBUG includes high-frequency input/output events, but never logs Base64 audio,
-instructions, transcripts, or generated text.
-
 The Python client supports the following command-line arguments:
 
 - `--query-type` (or `-q`): Query type (default: `use_video`). Options: `text`, `use_audio`, `use_image`, `use_video`

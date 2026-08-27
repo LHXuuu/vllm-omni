@@ -29,10 +29,6 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
 from vllm_omni.experimental.fullduplex.openai.realtime_session import (
     NativeRealtimeSessionProtocol,
 )
-from vllm_omni.experimental.fullduplex.openai.realtime_trace import (
-    trace_realtime_action,
-    trace_realtime_event,
-)
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     PcmAppendReservation,
     ServingRuntimeSessionState,
@@ -81,12 +77,6 @@ class DuplexSessionRunnerMixin:
             nonlocal resume_credential_delivered
             try:
                 await websocket.send_json(payload)
-                trace_realtime_event(
-                    "websocket",
-                    "server_event",
-                    payload,
-                    session_id=session.session_id if session is not None else None,
-                )
             except RuntimeError as exc:
                 message = str(exc)
                 if "after sending 'websocket.close'" in message or "response already completed" in message:
@@ -184,12 +174,6 @@ class DuplexSessionRunnerMixin:
                 )
                 if not accepted:
                     return
-                trace_realtime_event(
-                    "session_runner",
-                    "domain_event",
-                    payload,
-                    session_id=session.session_id if session is not None else None,
-                )
                 await send_outbound(payload)
                 if deferred_overlap_payload is not None:
                     deferred_precreate_response = native.deferred_precreate_response
@@ -247,12 +231,6 @@ class DuplexSessionRunnerMixin:
                             {"type": "error", "error": "Duplex event missing string type", "code": "bad_event"}
                         )
                         continue
-                    trace_realtime_event(
-                        "protocol",
-                        "translated_event",
-                        event,
-                        session_id=session.session_id,
-                    )
                     session_update_ack: asyncio.Future[None] | None = None
                     if (
                         realtime_protocol is not None
@@ -339,14 +317,6 @@ class DuplexSessionRunnerMixin:
 
         def start_chat_response() -> None:
             assert session is not None
-            trace_realtime_action(
-                "session_runner",
-                "chat_response_scheduled",
-                session_id=session.session_id,
-                epoch=session.epoch,
-                committed_turns=session.input_commit_seq,
-                history_messages=len(session.history),
-            )
 
             async def run_and_notify() -> None:
                 task = asyncio.current_task()
@@ -404,15 +374,6 @@ class DuplexSessionRunnerMixin:
         ) -> None:
             assert session is not None
             active_response = chat_response_in_progress()
-            trace_realtime_action(
-                "server_vad",
-                "turn_commit_requested",
-                session_id=session.session_id,
-                item_id=item_id,
-                create_response=create_response,
-                active_response=active_response,
-                pending_turn=session.pending_server_vad_turn is not None,
-            )
             if active_response and session.pending_server_vad_turn is not None:
                 released = session.discard_uncommitted_server_vad_utterance()
                 session.release_input_bytes(released)
@@ -448,15 +409,6 @@ class DuplexSessionRunnerMixin:
                 )
             else:
                 session.register_history_item(item_id, committed.message)
-            trace_realtime_action(
-                "server_vad",
-                "turn_committed",
-                session_id=session.session_id,
-                item_id=item_id,
-                create_response=create_response,
-                queued=active_response,
-                history_messages=len(session.history),
-            )
             await emit_event(
                 self._input_committed_payload(
                     session,
@@ -1639,17 +1591,6 @@ class DuplexSessionRunnerMixin:
                             - previous_scratch_bytes
                         )
                         session.release_input_bytes(max(0, reserved_bytes - retained_delta))
-                        trace_realtime_action(
-                            "server_vad",
-                            "batch_processed",
-                            session_id=session.session_id,
-                            input_samples=source_samples,
-                            input_sample_rate_hz=source_sample_rate_hz,
-                            frames=len(vad_batch.frames),
-                            inference_ms=round(vad_batch.inference_ms, 3),
-                            scratch_bytes=pipeline.scratch_bytes,
-                            speech_active=pipeline.speech_active,
-                        )
                         self._realtime_vad_metrics.observe_inference(
                             session.config.model or self._chat_service.model_config.model,
                             vad_batch.inference_ms,
@@ -2389,12 +2330,6 @@ class DuplexSessionRunnerMixin:
                                 ),
                                 activity=DuplexLeaseActivity.DETACH,
                             )
-                    trace_realtime_action(
-                        "session_runner",
-                        "session_detached",
-                        session_id=session.session_id,
-                        stale_output_dropped=actor.stale_output_dropped,
-                    )
                 else:
                     begin_close(actor.close_reason or "disconnect")
                     await actor.cancel_append_tasks()
@@ -2417,13 +2352,6 @@ class DuplexSessionRunnerMixin:
                     with suppress(Exception):
                         await self._attachment_registry.close(session.session_id)
                     self._stop_lifecycle_listener_if_idle()
-                    trace_realtime_action(
-                        "session_runner",
-                        "session_closed",
-                        session_id=session.session_id,
-                        reason=actor.close_reason or "disconnect",
-                        stale_output_dropped=actor.stale_output_dropped,
-                    )
             await actor.close_writer()
             with suppress(Exception):
                 await asyncio.wait_for(actor.output_queue.join(), timeout=2.0)

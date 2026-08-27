@@ -10,11 +10,6 @@ from typing import Any
 
 from fastapi import WebSocketDisconnect
 
-from vllm_omni.experimental.fullduplex.openai.realtime_trace import (
-    trace_realtime_action,
-    trace_realtime_event,
-)
-
 INPUT_EVENTS = frozenset(
     {
         "input.text.append",
@@ -201,24 +196,15 @@ class DuplexWebSocketActor:
                 raw_realtime = payload.pop("_realtime_raw", False) is True
                 if not raw_realtime and self._is_stale_model_output(payload):
                     self.stale_output_dropped += 1
-                    trace_realtime_action(
-                        "websocket",
-                        "stale_output_dropped",
-                        event=payload.get("type"),
-                        epoch=payload.get("epoch"),
-                    )
                     continue
                 try:
                     if raw_realtime:
                         await self.websocket.send_json(payload)
-                        trace_realtime_event("websocket", "server_event", payload)
                     elif self.outbound_protocol is not None:
                         for projected in self.outbound_protocol.encode_outbound_event(payload):
                             await self.websocket.send_json(projected)
-                            trace_realtime_event("websocket", "server_event", projected)
                     else:
                         await self.websocket.send_json(payload)
-                        trace_realtime_event("websocket", "server_event", payload)
                 except (WebSocketDisconnect, RuntimeError):
                     return
             finally:
