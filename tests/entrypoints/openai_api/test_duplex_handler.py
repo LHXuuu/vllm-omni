@@ -309,6 +309,24 @@ class FakeChatService:
         return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
 
 
+def test_server_vad_metrics_use_served_model_name():
+    chat_service = FakeChatService(FakeEngineClient())
+    handler = OmniDuplexSessionHandler(chat_service=chat_service, served_model_name="served-model")
+    started: list[str] = []
+    finished: list[str] = []
+    handler._realtime_vad_metrics = SimpleNamespace(
+        session_started=started.append,
+        session_finished=finished.append,
+    )
+    session = DuplexSession("sid-metrics", DuplexSessionConfig(model="client-model"))
+
+    handler._install_server_vad_pipeline(session, SimpleNamespace(reset=lambda: None))
+    handler._install_server_vad_pipeline(session, None)
+
+    assert started == ["served-model"]
+    assert finished == ["served-model"]
+
+
 class TurnBasedFakeChatService(FakeChatService):
     """Chat-fallback service without a model-native duplex adapter."""
 

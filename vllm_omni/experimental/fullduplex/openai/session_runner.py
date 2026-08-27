@@ -351,7 +351,7 @@ class DuplexSessionRunnerMixin:
             session.cancel_pending_input()
             pipeline.reset()
             self._realtime_vad_metrics.error(
-                session.config.model or self._chat_service.model_config.model,
+                self._server_vad_metrics_model_name,
                 metric_reason,
             )
             await emit_event(
@@ -385,7 +385,7 @@ class DuplexSessionRunnerMixin:
                 released = session.discard_uncommitted_server_vad_utterance()
                 session.release_input_bytes(released)
                 self._realtime_vad_metrics.error(
-                    session.config.model or self._chat_service.model_config.model,
+                    self._server_vad_metrics_model_name,
                     "pending_turn_backpressure",
                 )
                 await emit_event(
@@ -817,7 +817,7 @@ class DuplexSessionRunnerMixin:
                 except Exception as exc:
                     logger.exception("Server VAD initialization failed: %s", exc)
                     self._realtime_vad_metrics.error(
-                        session.config.model or self._chat_service.model_config.model,
+                        self._server_vad_metrics_model_name,
                         "initialization",
                     )
                     await emit_event(
@@ -1269,7 +1269,7 @@ class DuplexSessionRunnerMixin:
                                 except Exception as exc:
                                     logger.exception("Server VAD session update failed: %s", exc)
                                     self._realtime_vad_metrics.error(
-                                        candidate_config.model or self._chat_service.model_config.model,
+                                        self._server_vad_metrics_model_name,
                                         "initialization",
                                     )
                                     await emit_event(
@@ -1563,7 +1563,7 @@ class DuplexSessionRunnerMixin:
                         )
                         session.release_input_bytes(max(0, reserved_bytes - retained_delta))
                         self._realtime_vad_metrics.observe_inference(
-                            session.config.model or self._chat_service.model_config.model,
+                            self._server_vad_metrics_model_name,
                             vad_batch.inference_ms,
                         )
                         prefix_samples = round(
@@ -1600,7 +1600,7 @@ class DuplexSessionRunnerMixin:
                                 )
                                 if vad_frame.decision.endpoint_delay_ms is not None:
                                     self._realtime_vad_metrics.observe_endpoint_delay(
-                                        session.config.model or self._chat_service.model_config.model,
+                                        self._server_vad_metrics_model_name,
                                         vad_frame.decision.endpoint_delay_ms,
                                     )
                                 remaining_frame_bytes = sum(

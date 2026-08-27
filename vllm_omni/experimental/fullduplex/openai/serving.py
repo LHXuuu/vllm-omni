@@ -108,6 +108,7 @@ class OmniDuplexSessionHandler(
         self,
         *,
         chat_service: OmniOpenAIServingChat,
+        served_model_name: str | None = None,
         config_timeout_s: float = _DEFAULT_CONFIG_TIMEOUT_S,
         idle_timeout_s: float = _DEFAULT_IDLE_TIMEOUT_S,
         duplex_session_config: DuplexSessionRuntimeConfig | None = None,
@@ -123,6 +124,7 @@ class OmniDuplexSessionHandler(
             model_path=self._duplex_session_config.server_vad_model_path,
         )
         self._server_vad_pipelines: dict[str, ServerVADPipeline] = {}
+        self._server_vad_metrics_model_name = served_model_name or chat_service.model_config.model
         self._server_vad_metric_models: dict[str, str] = {}
         self._realtime_vad_metrics = RealtimeVADMetrics()
         self._registry = DuplexSessionRegistry(
@@ -1554,7 +1556,7 @@ class OmniDuplexSessionHandler(
         if pipeline is None:
             return
         self._server_vad_pipelines[session.session_id] = pipeline
-        model_name = session.config.model or self._chat_service.model_config.model
+        model_name = self._server_vad_metrics_model_name
         self._server_vad_metric_models[session.session_id] = model_name
         self._realtime_vad_metrics.session_started(model_name)
 
