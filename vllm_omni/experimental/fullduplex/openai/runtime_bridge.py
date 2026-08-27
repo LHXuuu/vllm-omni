@@ -21,9 +21,6 @@ from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     coerce_int,
     payload_turn_id,
 )
-from vllm_omni.experimental.fullduplex.openai.websocket import (
-    cancel_tasks_with_hard_timeout,
-)
 
 logger = init_logger(__name__)
 
@@ -251,7 +248,11 @@ class NativeRuntimeBridgeMixin:
                 # decision that lands in the swap window.
                 native.data_plane_restart_requested = True
                 return False
-            await cancel_tasks_with_hard_timeout((old_task,), timeout_s=0.25)
+            old_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.gather(old_task, return_exceptions=True), timeout=0.25)
+            except asyncio.TimeoutError:
+                pass
 
         async def _run() -> None:
             close_reason: str | None = None
@@ -438,9 +439,13 @@ class NativeRuntimeBridgeMixin:
         native.data_plane_restart_requested = False
         if task is None or task.done():
             return False
-        await cancel_tasks_with_hard_timeout((task,), timeout_s=0.25)
-        # The task still carries the old expected_epoch and late model output
-        # is filtered by the writer if it does not stop before the deadline.
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=0.25)
+        except asyncio.TimeoutError:
+            # Keep barge-in/cancel responsive. The task still carries the old
+            # expected_epoch and late model output is filtered by the writer.
+            pass
         return True
 
     async def _signal_runtime_session(

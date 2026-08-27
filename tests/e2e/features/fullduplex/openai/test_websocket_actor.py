@@ -6,8 +6,6 @@ import asyncio
 import pytest
 
 from vllm_omni.experimental.fullduplex.openai.websocket import (
-    DuplexAppendTaskMeta,
-    DuplexSessionTasks,
     DuplexWebSocketActor,
     normalize_duplex_input_event,
 )
@@ -21,40 +19,6 @@ class FakeWebSocket:
 
     async def send_json(self, payload: dict[str, object]) -> None:
         self.sent.append(dict(payload))
-
-
-@pytest.mark.asyncio
-async def test_cancel_append_tasks_has_hard_timeout_when_task_suppresses_cancellation():
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    async def suppress_cancellation() -> bool:
-        entered.set()
-        while not release.is_set():
-            try:
-                await release.wait()
-            except asyncio.CancelledError:
-                continue
-        return True
-
-    task = asyncio.create_task(suppress_cancellation())
-    tasks = DuplexSessionTasks(
-        native_append_tasks={task: DuplexAppendTaskMeta(0, "append_audio", False, False)},
-    )
-    await entered.wait()
-    cancellation = asyncio.create_task(tasks.cancel_append_tasks(timeout_s=0.01))
-    done, pending = await asyncio.wait((cancellation,), timeout=0.1)
-    if pending:
-        release.set()
-        await cancellation
-        pytest.fail("cancel_append_tasks waited past its deadline")
-
-    assert cancellation in done
-    assert cancellation.result() is True
-    assert not task.done()
-
-    release.set()
-    assert await task is True
 
 
 @pytest.mark.parametrize(

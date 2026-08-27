@@ -72,7 +72,6 @@ from vllm_omni.experimental.fullduplex.openai.websocket import (
     DOMAIN_TERMINAL_EVENTS,
     DuplexSessionTasks,
     DuplexWebSocketActor,
-    cancel_tasks_with_hard_timeout,
 )
 from vllm_omni.metrics.realtime import RealtimeVADMetrics
 
@@ -240,12 +239,16 @@ class OmniDuplexSessionHandler(
             await tasks.cancel_append_tasks()
             active_response_task = tasks.active_response_task
             if active_response_task is not None and not active_response_task.done():
-                await cancel_tasks_with_hard_timeout((active_response_task,), timeout_s=0.25)
+                active_response_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await active_response_task
         native = self._serving_session_states.get(session.session_id)
         if native is not None and native.data_plane_task is not None:
             data_plane_task = native.data_plane_task
             native.data_plane_task = None
-            await cancel_tasks_with_hard_timeout((data_plane_task,), timeout_s=0.25)
+            data_plane_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await data_plane_task
         if session.active_response_id is not None:
             session.end_response(commit_text=False)
         self._cleanup_duplex_session_state(session)
@@ -1883,7 +1886,11 @@ class OmniDuplexSessionHandler(
                 notify=notify,
             )
         if has_running_task and active_task is not None:
-            await cancel_tasks_with_hard_timeout((active_task,), timeout_s=0.25)
+            active_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.gather(active_task, return_exceptions=True), timeout=0.25)
+            except asyncio.TimeoutError:
+                pass
         if notify:
             await send_json(
                 {

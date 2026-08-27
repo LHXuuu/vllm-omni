@@ -4,8 +4,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable
-from contextlib import suppress
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -85,38 +84,6 @@ DOMAIN_TERMINAL_EVENTS = frozenset(
     }
 )
 
-_RETAINED_CANCELLING_TASKS: set[asyncio.Task[Any]] = set()
-
-
-def _release_cancelled_task(task: asyncio.Task[Any]) -> None:
-    _RETAINED_CANCELLING_TASKS.discard(task)
-    with suppress(asyncio.CancelledError):
-        task.exception()
-
-
-async def cancel_tasks_with_hard_timeout(
-    tasks: Iterable[asyncio.Task[Any]],
-    *,
-    timeout_s: float,
-) -> set[asyncio.Task[Any]]:
-    """Request cancellation without waiting past ``timeout_s``.
-
-    ``asyncio.wait_for(gather(...))`` waits for the wrapped future to finish
-    cancelling after its timeout. A child that delays or suppresses
-    ``CancelledError`` can therefore block the caller indefinitely. Keep
-    unfinished tasks referenced for fencing and use ``asyncio.wait`` so the
-    timeout remains a hard upper bound.
-    """
-    active = {task for task in tasks if not task.done()}
-    if not active:
-        return set()
-    for task in active:
-        _RETAINED_CANCELLING_TASKS.add(task)
-        task.add_done_callback(_release_cancelled_task)
-        task.cancel()
-    _, pending = await asyncio.wait(active, timeout=max(0.0, timeout_s))
-    return pending
-
 
 def is_input_event(event_type: object) -> bool:
     return isinstance(event_type, str) and event_type in INPUT_EVENTS
@@ -159,7 +126,12 @@ class DuplexSessionTasks:
         ]
         if not tasks:
             return False
-        await cancel_tasks_with_hard_timeout(tasks, timeout_s=timeout_s)
+        for task in tasks:
+            task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
+        except TimeoutError:
+            pass
         return True
 
 
@@ -303,6 +275,5 @@ __all__ = [
     "DuplexAppendTaskMeta",
     "DuplexSessionTasks",
     "DuplexWebSocketActor",
-    "cancel_tasks_with_hard_timeout",
     "is_input_event",
 ]
