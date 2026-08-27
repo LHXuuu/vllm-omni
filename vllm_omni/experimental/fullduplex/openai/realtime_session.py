@@ -13,6 +13,7 @@ from vllm_omni.experimental.fullduplex.openai.realtime_input import (
 from vllm_omni.experimental.fullduplex.openai.realtime_output import (
     RealtimeOutputProjector,
 )
+
 REALTIME_ERROR_TYPES_BY_CODE = _state.REALTIME_ERROR_TYPES_BY_CODE
 REALTIME_INPUT_AUDIO_FORMATS = _state.REALTIME_INPUT_AUDIO_FORMATS
 REALTIME_OUTPUT_AUDIO_FORMATS = _state.REALTIME_OUTPUT_AUDIO_FORMATS
