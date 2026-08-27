@@ -427,12 +427,14 @@ class FakeServerVADBackend:
 
     def __init__(self, probabilities: list[float]) -> None:
         self.probabilities = probabilities
+        self.calls = 0
 
     def new_state(self) -> int:
         return 0
 
     def infer(self, frame: np.ndarray, state: object) -> tuple[float, object]:
         del frame
+        self.calls += 1
         index = int(state)
         probability = self.probabilities[index] if index < len(self.probabilities) else 0.0
         return probability, index + 1
@@ -693,6 +695,50 @@ async def test_native_realtime_protocol_conversation_item_create_commits_user_te
             }
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_complete_audio_item_preserves_explicit_manual_commit_translation():
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    protocol.bind_sender(ws.send_json)
+
+    ws.put(
+        {
+            "type": "session.update",
+            "session": {
+                "model": "test-model",
+                "audio": {"input": {"turn_detection": None}},
+            },
+        }
+    )
+    session_create = json.loads(await protocol.receive_internal_event_text(ws))
+    assert session_create["type"] == "session.create"
+
+    pcm16 = np.full(320, 8_192, dtype="<i2")
+    ws.put(
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "id": "item-manual-audio",
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "audio": base64.b64encode(pcm16.tobytes()).decode(),
+                    }
+                ],
+            },
+        }
+    )
+
+    append = json.loads(await protocol.receive_internal_event_text(ws))
+    commit = json.loads(await protocol.receive_internal_event_text(ws))
+
+    assert append["type"] == "input_audio_buffer.append"
+    assert commit["type"] == "input_audio_buffer.commit"
+    assert commit["item_id"] == "item-manual-audio"
 
 
 @pytest.mark.asyncio
@@ -1525,7 +1571,7 @@ async def test_realtime_server_vad_complete_audio_item_preserves_wire_item_and_u
                 "model": "test-model",
                 "audio": {
                     "input": {
-                        "format": {"type": "audio/pcm", "rate": 16_000},
+                        "format": {"type": "audio/pcm", "rate": 24_000},
                         "turn_detection": {
                             "type": "server_vad",
                             "create_response": True,
@@ -1536,7 +1582,9 @@ async def test_realtime_server_vad_complete_audio_item_preserves_wire_item_and_u
             },
         }
     )
-    pcm16 = np.arange(320, dtype="<i2")
+    sample_rate_hz = 24_000
+    samples = np.arange(sample_rate_hz // 10, dtype=np.float32)
+    pcm16 = np.rint(0.5 * np.sin(2 * np.pi * 1_000 * samples / sample_rate_hz) * 32_767).astype("<i2")
     public_audio = base64.b64encode(pcm16.tobytes()).decode()
     ws.put(
         {
@@ -1552,9 +1600,10 @@ async def test_realtime_server_vad_complete_audio_item_preserves_wire_item_and_u
     )
     engine = FakeEngineClient()
     chat_service = CapturingChatService(engine)
+    vad_backend = FakeServerVADBackend([0.0])
     handler = OmniDuplexSessionHandler(
         chat_service=chat_service,
-        server_vad_backend_provider=FakeServerVADProvider(FakeServerVADBackend([0.0])),
+        server_vad_backend_provider=FakeServerVADProvider(vad_backend),
     )
 
     await handler.handle_realtime_session(ws)  # type: ignore[arg-type]
@@ -1564,7 +1613,15 @@ async def test_realtime_server_vad_complete_audio_item_preserves_wire_item_and_u
     assert added["item"] == done["item"]
     assert done["item"]["content"] == [{"type": "input_audio", "audio": public_audio}]
     assert response_started_before_explicit_create is False
-    assert ws.sent_types().index("conversation.item.done") < ws.sent_types().index("response.created")
+    event_types = ws.sent_types()
+    assert event_types.index("conversation.item.added") < event_types.index("conversation.item.done")
+    assert event_types.index("conversation.item.done") < event_types.index("response.created")
+    assert not {
+        "input_audio_buffer.speech_started",
+        "input_audio_buffer.speech_stopped",
+        "input_audio_buffer.committed",
+    }.intersection(event_types)
+    assert vad_backend.calls == 0
     assert len(chat_service.requests) == 1
 
     request = chat_service.requests[0]
@@ -1576,7 +1633,7 @@ async def test_realtime_server_vad_complete_audio_item_preserves_wire_item_and_u
         assert wav_file.getnchannels() == 1
         assert wav_file.getsampwidth() == 2
         assert wav_file.getframerate() == 16_000
-        assert wav_file.getnframes() == pcm16.size
+        assert wav_file.getnframes() == 1_600
 
 
 @pytest.mark.asyncio
@@ -2338,6 +2395,23 @@ def test_duplex_session_playback_commit_uses_multi_delta_audio_text_marks():
 
     assert committed == {"role": "assistant", "content": "hello wo"}
     assert session.history == (committed,)
+
+
+def test_duplex_session_preserves_response_history_order_when_user_item_arrives_during_generation():
+    session = DuplexSession(session_id="sid-history-order", config=DuplexSessionConfig())
+    first_user = {"role": "user", "content": "first turn"}
+    next_user = {
+        "role": "user",
+        "content": [{"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,AAAA"}}],
+    }
+    session.append_history_message(first_user)
+    session.begin_response()
+    session.append_assistant_text("first answer")
+    session.append_history_message(next_user)
+
+    assistant = session.end_response(commit_text=True)
+
+    assert session.history == (first_user, assistant, next_user)
 
 
 @pytest.mark.asyncio

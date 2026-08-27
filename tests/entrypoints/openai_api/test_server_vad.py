@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 from scipy.signal import resample_poly
 
+from vllm_omni.experimental.fullduplex.openai.audio import resample_pcm16_mono
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexSession,
     DuplexSessionConfig,
@@ -94,6 +95,8 @@ def test_streaming_pcm16_resampler_binds_source_and_target_rates():
     for invalid_rate in (True, 0, -1):
         with pytest.raises(ValueError, match="positive integer"):
             _StreamingPCM16MonoResampler(source_rate_hz=invalid_rate, target_rate_hz=16_000)
+    with pytest.raises(ValueError, match="unsupported resampling ratio"):
+        _StreamingPCM16MonoResampler(source_rate_hz=191_999, target_rate_hz=16_000)
 
 
 @pytest.mark.parametrize("source_rate_hz", [8_000, 24_000, 44_100, 48_000])
@@ -111,6 +114,42 @@ def test_streaming_pcm16_resampler_matches_resample_poly(source_rate_hz: int, sa
 
     assert actual.size == (sample_count * 16_000 + source_rate_hz - 1) // source_rate_hz
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+
+
+def test_stateless_pcm16_resampler_matches_polyphase_reference():
+    rng = np.random.default_rng(24_000)
+    source = rng.integers(-32_768, 32_768, size=2_400, dtype=np.int16)
+
+    actual = np.frombuffer(
+        resample_pcm16_mono(
+            source.tobytes(),
+            source_rate_hz=24_000,
+            target_rate_hz=16_000,
+        ),
+        dtype="<i2",
+    )
+    expected = np.clip(
+        np.rint(_resample_reference(source) * 32_768.0),
+        -32_768,
+        32_767,
+    ).astype("<i2")
+
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=1)
+
+
+def test_stateless_pcm16_resampler_bounds_unusual_rate_ratios():
+    source = np.arange(2_400, dtype="<i2")
+
+    actual = np.frombuffer(
+        resample_pcm16_mono(
+            source.tobytes(),
+            source_rate_hz=191_999,
+            target_rate_hz=16_000,
+        ),
+        dtype="<i2",
+    )
+
+    assert actual.size == round(source.size * 16_000 / 191_999)
 
 
 @pytest.mark.parametrize(
@@ -395,98 +434,27 @@ def test_threshold_endpoint_policy_clamps_silero_exit_threshold():
 
 
 @pytest.mark.asyncio
-async def test_server_vad_complete_audio_item_bypasses_input_buffer_and_normalizes_to_wav():
-    protocol = NativeRealtimeSessionProtocol({})
-    protocol._turn_detection_configured = True
-    protocol._turn_detection = ServerVADConfig().as_dict()
-    protocol._input_audio_format = "pcm16"
-    protocol._input_sample_rate_hz = 24_000
-    pcm16 = np.arange(2_400, dtype="<i2")
-
-    public_audio = base64.b64encode(pcm16.tobytes()).decode()
-    event = {
-        "type": "conversation.item.create",
-        "event_id": "event-full-audio",
-        "item": {
-            "id": "item-full-audio",
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_audio", "audio": public_audio}],
-        },
-    }
-
-    translated = await protocol._to_duplex_event(event)
-
-    assert translated is not None
-    assert translated["type"] == "turn.signal"
-    assert translated["event"] == "conversation.item.create"
-    public_item = translated["payload"]["item"]
-    assert public_item["content"] == [{"type": "input_audio", "audio": public_audio}]
-    history_item = translated["payload"]["history_item"]
-    part = history_item["content"][0]
-    assert part["type"] == "input_audio"
-    assert part["format"] == "wav"
-    assert part["sample_rate_hz"] == 16_000
-    with wave.open(io.BytesIO(base64.b64decode(part["audio"])), "rb") as wav_file:
-        assert wav_file.getnchannels() == 1
-        assert wav_file.getsampwidth() == 2
-        assert wav_file.getframerate() == 16_000
-        assert wav_file.getnframes() == 1_600
-
-
-@pytest.mark.asyncio
-async def test_server_vad_complete_audio_item_keeps_wire_item_unchanged():
-    protocol = NativeRealtimeSessionProtocol({})
-    protocol._turn_detection_configured = True
-    protocol._turn_detection = ServerVADConfig().as_dict()
-    protocol._input_audio_format = "pcm16"
-    protocol._input_sample_rate_hz = 16_000
-    protocol._hold_realtime_output_until_session_created = False
-    sent: list[dict[str, object]] = []
-
-    async def send(payload: dict[str, object]) -> None:
-        sent.append(payload)
-
-    protocol.bind_sender(send)
-    public_audio = base64.b64encode(np.arange(320, dtype="<i2").tobytes()).decode()
-    event = {
-        "type": "conversation.item.create",
-        "event_id": "event-public-audio",
-        "item": {
-            "id": "item-public-audio",
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_audio", "audio": public_audio}],
-        },
-    }
-
-    translated = await protocol._to_duplex_event(event)
-    assert translated is not None
-    await protocol._send_realtime_input_ack(event)
-    projected = protocol.encode_outbound_event(
-        {
-            "type": "conversation.item.created",
-            "item": translated["payload"]["item"],
-            "created": True,
-        }
-    )
-
-    wire_items = [
-        payload["item"]
-        for payload in [*sent, *projected]
-        if payload["type"]
-        in {
-            "conversation.item.added",
-            "conversation.item.done",
-        }
-    ]
-    assert len(wire_items) == 2
-    assert all(item == wire_items[0] for item in wire_items)
-    assert wire_items[0]["content"] == [{"type": "input_audio", "audio": public_audio}]
-
-
-@pytest.mark.asyncio
-async def test_empty_complete_audio_item_returns_bad_audio_without_registration():
+@pytest.mark.parametrize(
+    ("audio", "part_overrides"),
+    [
+        pytest.param("", {}, id="empty"),
+        pytest.param("AAAAAA==!!!!", {}, id="invalid-base64"),
+        pytest.param(
+            base64.b64encode(np.zeros(480, dtype="<i2").tobytes()).decode(),
+            {"sample_rate_hz": 191_999},
+            id="sample-rate-override",
+        ),
+        pytest.param(
+            base64.b64encode(np.zeros(480, dtype="<i2").tobytes()).decode(),
+            {"format": "pcm_f32le"},
+            id="format-override",
+        ),
+    ],
+)
+async def test_invalid_complete_audio_item_returns_correlated_bad_audio(
+    audio: str,
+    part_overrides: dict[str, object],
+):
     protocol = NativeRealtimeSessionProtocol({})
     protocol._turn_detection_configured = True
     protocol._turn_detection = ServerVADConfig().as_dict()
@@ -501,12 +469,12 @@ async def test_empty_complete_audio_item_returns_bad_audio_without_registration(
     translated = await protocol._to_duplex_event(
         {
             "type": "conversation.item.create",
-            "event_id": "event-empty-audio",
+            "event_id": "event-invalid-audio",
             "item": {
-                "id": "item-empty-audio",
+                "id": "item-invalid-audio",
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_audio", "audio": ""}],
+                "content": [{"type": "input_audio", "audio": audio, **part_overrides}],
             },
         }
     )
@@ -514,36 +482,10 @@ async def test_empty_complete_audio_item_returns_bad_audio_without_registration(
     assert translated is None
     assert sent[-1]["type"] == "error"
     assert sent[-1]["error"]["code"] == "bad_audio"
-    assert "item-empty-audio" not in protocol._conversation_items
-
-
-@pytest.mark.asyncio
-async def test_complete_audio_item_preserves_manual_commit_translation_without_server_vad():
-    protocol = NativeRealtimeSessionProtocol({})
-    pcm16 = np.full(320, 8_192, dtype="<i2")
-
-    translated = await protocol._conversation_item_to_duplex(
-        {
-            "type": "conversation.item.create",
-            "item": {
-                "id": "item-manual-audio",
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_audio",
-                        "audio": base64.b64encode(pcm16.tobytes()).decode(),
-                    }
-                ],
-            },
-        }
+    assert sent[-1]["error"]["event_id"] == "event-invalid-audio"
+    assert not {"conversation.item.added", "conversation.item.done"}.intersection(
+        payload.get("type") for payload in sent
     )
-
-    assert translated is not None
-    assert translated["type"] == "input_audio_buffer.append"
-    queued = protocol._pending_outbound.get_nowait()
-    assert queued["type"] == "input_audio_buffer.commit"
-    assert queued["item_id"] == "item-manual-audio"
 
 
 def test_silero_backend_matches_upstream_v62_streaming_contract(monkeypatch, tmp_path):

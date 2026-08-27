@@ -1257,10 +1257,46 @@ class RealtimeInputTranslator:
                         )
                     )
                     return None
-                fmt, format_rate = self._parse_realtime_audio_format(part.get("format") or self._input_audio_format)
-                sample_rate_hz = (
-                    part.get("sample_rate_hz") or part.get("sample_rate") or format_rate or self._input_sample_rate_hz
-                )
+                raw_part_format = part.get("format")
+                fmt, format_rate = self._parse_realtime_audio_format(raw_part_format or self._input_audio_format)
+                explicit_sample_rate_hz = part.get("sample_rate_hz")
+                if explicit_sample_rate_hz is None:
+                    explicit_sample_rate_hz = part.get("sample_rate")
+                if explicit_sample_rate_hz is None and isinstance(raw_part_format, dict):
+                    explicit_sample_rate_hz = (
+                        raw_part_format.get("rate")
+                        if "rate" in raw_part_format
+                        else raw_part_format.get("sample_rate_hz", raw_part_format.get("sample_rate"))
+                    )
+                sample_rate_hz = explicit_sample_rate_hz or format_rate or self._input_sample_rate_hz
+                if server_vad_full_audio_item and (
+                    fmt != self._input_audio_format
+                    or (explicit_sample_rate_hz is not None and explicit_sample_rate_hz != self._input_sample_rate_hz)
+                ):
+                    await self._send_realtime_payload(
+                        self._realtime_error_payload(
+                            "bad_audio",
+                            "conversation.item.create input_audio must use the Session input format and sample rate",
+                            event_id=event.get("event_id"),
+                            param="item.content.audio",
+                        )
+                    )
+                    return None
+                if server_vad_full_audio_item:
+                    fmt = self._input_audio_format
+                    sample_rate_hz = self._input_sample_rate_hz
+                    try:
+                        base64.b64decode(audio.strip(), validate=True)
+                    except (binascii.Error, ValueError):
+                        await self._send_realtime_payload(
+                            self._realtime_error_payload(
+                                "bad_audio",
+                                "conversation.item.create input_audio is not valid Base64",
+                                event_id=event.get("event_id"),
+                                param="item.content.audio",
+                            )
+                        )
+                        return None
                 if not self._is_supported_realtime_input_format(fmt):
                     continue
                 try:
@@ -1370,10 +1406,6 @@ class RealtimeInputTranslator:
         sample_rate_hz: object,
     ) -> tuple[str, str, int]:
         """Package a complete Realtime audio item for the chat fallback path."""
-        if fmt == "wav":
-            if not isinstance(sample_rate_hz, int | float) or sample_rate_hz <= 0:
-                raise ValueError("conversation.item.create input_audio requires a valid sample rate")
-            return audio, "wav", int(sample_rate_hz)
         if fmt != "pcm_f32le" or not isinstance(sample_rate_hz, int | float) or sample_rate_hz <= 0:
             raise ValueError("conversation.item.create input_audio could not be normalized")
         try:

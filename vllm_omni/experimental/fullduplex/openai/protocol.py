@@ -432,6 +432,7 @@ class ResponseState:
     active_request_id: str | None = None
     active_response_id: str | None = None
     active_response_turn_id: int | None = None
+    history_insert_index: int | None = None
     last_response_id: str | None = None
     assistant_text_buffer: list[str] = field(default_factory=list)
     assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
@@ -896,6 +897,7 @@ class DuplexSession:
         response_id = f"resp-{self.session_id}-{self.epoch}-{uuid4().hex[:8]}"
         self._response.active_response_id = response_id
         self._response.active_response_turn_id = self.turn_id if turn_id is None else int(turn_id)
+        self._response.history_insert_index = len(self._conversation.messages)
         self._response.last_response_id = response_id
         self._response.assistant_text_buffer.clear()
         self._response.assistant_audio_text_marks.clear()
@@ -1106,12 +1108,17 @@ class DuplexSession:
             committed_text = ""
         if commit_text and committed_text:
             message = {"role": "assistant", "content": committed_text}
-            self._conversation.messages.append(message)
+            history_insert_index = self._response.history_insert_index
+            if history_insert_index is None:
+                self._conversation.messages.append(message)
+            else:
+                self._conversation.messages.insert(history_insert_index, message)
         self._response.assistant_text_buffer.clear()
         if not preserve_request:
             self._response.active_request_id = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
+        self._response.history_insert_index = None
         self._clear_response_metrics()
         self.turn_state = DuplexTurnState.IDLE
         self._restore_response_config()
@@ -1373,6 +1380,7 @@ class DuplexSession:
         self._response.active_request_id = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
+        self._response.history_insert_index = None
         self._clear_response_metrics()
         self._restore_response_config()
         self.turn_state = DuplexTurnState.BARGE_IN
@@ -1386,6 +1394,7 @@ class DuplexSession:
         self.state = DuplexSessionState.CLOSED
         self.turn_state = DuplexTurnState.IDLE
         self._response.active_response_turn_id = None
+        self._response.history_insert_index = None
         self.clear_server_vad_audio()
         self._input.pending_server_vad_turn = None
         self._clear_response_metrics()
