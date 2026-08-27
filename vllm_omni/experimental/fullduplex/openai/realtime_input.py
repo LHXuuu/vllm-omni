@@ -1123,12 +1123,6 @@ class RealtimeInputTranslator:
         configured: bool,
         normalized: dict[str, object] | None,
     ) -> str | None:
-        if (
-            configured
-            and self._turn_detection_config_locked
-            and (not self._turn_detection_configured or normalized != self._turn_detection)
-        ):
-            return "turn_detection cannot be changed after the first audio append"
         effective_turn_detection = normalized if configured else self._turn_detection
         if effective_turn_detection is not None:
             audio_config = session_payload.get("audio")
@@ -1177,10 +1171,6 @@ class RealtimeInputTranslator:
             normalized=normalized,
         )
         self._apply_realtime_session_defaults(session_payload)
-
-    def lock_realtime_turn_detection_config(self) -> None:
-        """Freeze turn detection after Serving accepts the first audio append."""
-        self._turn_detection_config_locked = True
 
     def clear_realtime_input_buffer_state(self) -> None:
         """Synchronize protocol input state after Serving discards the buffer."""

@@ -144,7 +144,6 @@ class RealtimeSessionState:
     _input_audio_buffer_transcript_parts: list[str] = field(default_factory=list)
     _turn_detection_configured: bool = False
     _turn_detection: dict[str, object] | None = None
-    _turn_detection_config_locked: bool = False
 
     @classmethod
     def from_query_params(cls, query_params: Any) -> RealtimeSessionState:
@@ -222,4 +221,3 @@ class RealtimeStateOwner:
     _input_audio_buffer_transcript_parts: list[str] = _RealtimeStateField()
     _turn_detection_configured: bool = _RealtimeStateField()
     _turn_detection: dict[str, object] | None = _RealtimeStateField()
-    _turn_detection_config_locked: bool = _RealtimeStateField()

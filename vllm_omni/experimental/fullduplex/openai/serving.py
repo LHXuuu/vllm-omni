@@ -1525,7 +1525,7 @@ class OmniDuplexSessionHandler(
                     return {
                         "type": "error",
                         "session_id": session.session_id,
-                        "code": "invalid_request_error",
+                        "code": "unsupported_turn_detection",
                         "error": "turn_detection cannot be changed after the first audio append",
                     }
                 session.config.turn_detection_configured = True

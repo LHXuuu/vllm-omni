@@ -239,17 +239,6 @@ class DuplexSessionRunnerMixin:
                     ):
                         session_update_ack = asyncio.get_running_loop().create_future()
                         event["_duplex_session_update_ack"] = session_update_ack
-                    server_vad_append_ack: asyncio.Future[None] | None = None
-                    if (
-                        realtime_protocol is not None
-                        and event_type == "input_audio_buffer.append"
-                        and session.config.server_vad is not None
-                        and not self._uses_native_input_append(session)
-                        and isinstance(event.get("audio"), str)
-                        and bool(event.get("audio"))
-                    ):
-                        server_vad_append_ack = asyncio.get_running_loop().create_future()
-                        event["_duplex_server_vad_append_ack"] = server_vad_append_ack
                     if event_type in {"input.commit", "input_audio_buffer.commit"}:
                         if not session.reserve_pending_turn(
                             limit=self._duplex_session_config.max_pending_turns_per_session
@@ -269,8 +258,6 @@ class DuplexSessionRunnerMixin:
                     await actor.enqueue_event(event)
                     if session_update_ack is not None:
                         await session_update_ack
-                    if server_vad_append_ack is not None:
-                        await server_vad_append_ack
             except WebSocketDisconnect:
                 await actor.enqueue_event({"type": "__disconnect__"})
 
@@ -341,20 +328,6 @@ class DuplexSessionRunnerMixin:
         def resolve_session_update_ack(event: dict[str, object]) -> None:
             ack = event.pop("_duplex_session_update_ack", None)
             if isinstance(ack, asyncio.Future) and not ack.done():
-                ack.set_result(None)
-
-        def resolve_server_vad_append_ack(
-            event: dict[str, object],
-            *,
-            accepted: bool,
-        ) -> None:
-            ack = event.pop("_duplex_server_vad_append_ack", None)
-            if not isinstance(ack, asyncio.Future):
-                return
-            if accepted:
-                if realtime_protocol is not None:
-                    realtime_protocol.lock_realtime_turn_detection_config()
-            if not ack.done():
                 ack.set_result(None)
 
         def correlate_realtime_error(
@@ -1480,7 +1453,6 @@ class DuplexSessionRunnerMixin:
                                     realtime_event_id,
                                 )
                             )
-                            resolve_server_vad_append_ack(event, accepted=False)
                             continue
                         try:
                             if fmt != "pcm16":
@@ -1511,7 +1483,6 @@ class DuplexSessionRunnerMixin:
                                     realtime_event_id,
                                 )
                             )
-                            resolve_server_vad_append_ack(event, accepted=False)
                             continue
                         previous_scratch_bytes = pipeline.scratch_bytes
                         normalized_sample_upper_bound = (
@@ -1549,7 +1520,6 @@ class DuplexSessionRunnerMixin:
                             )
                             if realtime_protocol is not None:
                                 realtime_protocol.clear_realtime_input_buffer_state()
-                            resolve_server_vad_append_ack(event, accepted=False)
                             continue
                         try:
                             vad_batch = await pipeline.push_pcm16(
@@ -1583,7 +1553,6 @@ class DuplexSessionRunnerMixin:
                             )
                             if realtime_protocol is not None:
                                 realtime_protocol.clear_realtime_input_buffer_state()
-                            resolve_server_vad_append_ack(event, accepted=False)
                             continue
                         retained_delta = (
                             sum(frame.samples.nbytes for frame in vad_batch.frames)
@@ -1644,7 +1613,6 @@ class DuplexSessionRunnerMixin:
                         accepted_audio = source_samples > 0
                         if accepted_audio:
                             session.lock_turn_detection_config()
-                        resolve_server_vad_append_ack(event, accepted=accepted_audio)
                         continue
                     # Speech/silence tag for the Stage0 turn-ended latch.
                     payload["is_speech"] = self._input_looks_like_speech(event, payload, session=session)
