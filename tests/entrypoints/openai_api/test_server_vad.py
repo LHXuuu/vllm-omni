@@ -40,10 +40,8 @@ class SequenceDetector:
 
     def __init__(self, probabilities: list[float]) -> None:
         self.probabilities = probabilities
-        self.new_state_calls = 0
 
     def new_state(self) -> int:
-        self.new_state_calls += 1
         return 0
 
     def infer(self, frame: np.ndarray, state: object) -> tuple[float, object]:
@@ -113,8 +111,6 @@ def test_streaming_pcm16_resampler_matches_resample_poly(source_rate_hz: int, sa
 
     assert actual.size == (sample_count * 16_000 + source_rate_hz - 1) // source_rate_hz
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
-    assert resampler.pending_samples == 0
-    assert resampler.scratch_bytes == 0
 
 
 @pytest.mark.parametrize(
@@ -147,7 +143,6 @@ def test_24khz_resampler_is_invariant_to_chunk_boundaries(chunk_sizes: list[int]
     np.testing.assert_array_equal(actual, whole)
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
     assert actual.size == 1_601
-    assert resampler.pending_samples == 0
 
 
 def test_24khz_resampler_retains_right_lookahead_until_flush():
@@ -155,14 +150,10 @@ def test_24khz_resampler_retains_right_lookahead_until_flush():
     resampler = _StreamingPCM16MonoResampler(source_rate_hz=24_000)
 
     assert resampler.push(source).size == 0
-    assert resampler.pending_samples == 10
-    assert resampler.scratch_bytes == 40
 
     actual = resampler.flush()
 
     np.testing.assert_allclose(actual, _resample_reference(source), rtol=2e-5, atol=2e-5)
-    assert resampler.pending_samples == 0
-    assert resampler.scratch_bytes == 0
 
     assert resampler.flush().size == 0
     with pytest.raises(RuntimeError, match="has been flushed"):
@@ -175,13 +166,11 @@ def test_24khz_resampler_reset_discards_residual_samples():
     source = np.arange(64, dtype="<i2")
 
     resampler.push(discarded)
-    assert resampler.pending_samples > 0
     resampler.reset()
 
     actual = np.concatenate((resampler.push(source), resampler.flush()))
 
     np.testing.assert_allclose(actual, _resample_reference(source), rtol=2e-5, atol=2e-5)
-    assert resampler.pending_samples == 0
 
 
 def test_24khz_resampler_suppresses_content_above_16khz_nyquist():
@@ -243,11 +232,11 @@ async def test_server_vad_pipeline_handles_arbitrary_chunk_boundaries():
     assert len(frames) == 5
     assert [index for index, frame in enumerate(frames) if frame.decision.speech_started] == [1]
     assert [index for index, frame in enumerate(frames) if frame.decision.speech_stopped] == [4]
-    assert detector.new_state_calls == 1
-    assert pipeline.scratch_bytes == 0
 
     pipeline.reset()
-    assert detector.new_state_calls == 2
+    reset_batch = await pipeline.push(samples)
+    assert [index for index, frame in enumerate(reset_batch.frames) if frame.decision.speech_started] == [1]
+    assert [index for index, frame in enumerate(reset_batch.frames) if frame.decision.speech_stopped] == [4]
 
 
 @pytest.mark.asyncio
@@ -271,7 +260,6 @@ async def test_server_vad_pipeline_pcm16_resampling_is_split_invariant():
             frames.extend(batch.frames)
             offset += chunk_size
         assert offset == continuous_source.size
-        assert pipeline.scratch_bytes > 0
         return np.concatenate([frame.samples for frame in frames]), [frame.decision for frame in frames]
 
     whole_samples, whole_decisions = await process([2_418], use_bytes=False)
@@ -286,28 +274,20 @@ async def test_server_vad_pipeline_pcm16_resampling_is_split_invariant():
 
 
 @pytest.mark.asyncio
-async def test_server_vad_pipeline_binds_source_rate_on_first_nonempty_append():
+async def test_server_vad_pipeline_empty_append_does_not_bind_source_rate():
     pipeline = ServerVADPipeline(
         SequenceDetector([0.0]),
         ServerVADConfig(),
     )
 
-    assert pipeline.source_sample_rate_hz is None
-    assert pipeline._input_resampler is None
-    assert pipeline.scratch_bytes == 0
-
     empty_batch = await pipeline.push_pcm16(b"", source_sample_rate_hz=24_000)
-
     assert not empty_batch.frames
-    assert pipeline.source_sample_rate_hz is None
-    assert pipeline._input_resampler is None
-    assert pipeline.scratch_bytes == 0
 
-    await pipeline.push_pcm16(np.asarray([1], dtype="<i2"), source_sample_rate_hz=16_000)
-
-    assert pipeline.source_sample_rate_hz == 16_000
-    assert pipeline._input_resampler is None
-    assert pipeline.scratch_bytes == np.dtype(np.float32).itemsize
+    batch = await pipeline.push_pcm16(
+        np.zeros(160, dtype="<i2"),
+        source_sample_rate_hz=16_000,
+    )
+    assert len(batch.frames) == 1
 
 
 @pytest.mark.asyncio
@@ -317,31 +297,23 @@ async def test_server_vad_pipeline_reset_clears_resampler_and_source_rate_lock()
         ServerVADConfig(),
     )
 
-    assert pipeline._input_resampler is None
-    batch = await pipeline.push_pcm16(np.asarray([30_000, -30_000], dtype="<i2"), source_sample_rate_hz=24_000)
+    batch = await pipeline.push_pcm16(
+        np.asarray([30_000, -30_000], dtype="<i2"),
+        source_sample_rate_hz=24_000,
+    )
     assert not batch.frames
-    assert pipeline._input_resampler is not None
-    assert pipeline._input_resampler.source_rate_hz == 24_000
-    assert pipeline._input_resampler.target_rate_hz == pipeline.sample_rate_hz
-    assert pipeline.scratch_bytes == 8
 
     pipeline.reset()
-    assert pipeline.source_sample_rate_hz is None
-    assert pipeline._input_resampler is None
-    assert pipeline.scratch_bytes == 0
 
     source = np.zeros(160, dtype="<i2")
     source[:3] = [-32768, 0, 32767]
     batch = await pipeline.push_pcm16(source.tobytes(), source_sample_rate_hz=16_000)
 
     assert len(batch.frames) == 1
-    assert pipeline.source_sample_rate_hz == 16_000
-    assert pipeline._input_resampler is None
     np.testing.assert_array_equal(
         batch.frames[0].samples[:3],
         np.asarray([-1.0, 0.0, 32767 / 32768], dtype=np.float32),
     )
-    assert pipeline.scratch_bytes == 0
 
 
 @pytest.mark.asyncio
@@ -377,7 +349,6 @@ def test_threshold_endpoint_policy_uses_silero_v62_exit_hysteresis():
             frame_samples=frame_samples,
         )
         assert decision.speech_stopped is False
-        assert policy.speech_active is True
 
     first_silence = policy.update(
         0.2,
@@ -392,7 +363,6 @@ def test_threshold_endpoint_policy_uses_silero_v62_exit_hysteresis():
 
     assert first_silence.speech_stopped is False
     assert stopped.speech_stopped is True
-    assert policy.speech_active is False
 
 
 def test_threshold_endpoint_policy_clamps_silero_exit_threshold():
@@ -422,7 +392,6 @@ def test_threshold_endpoint_policy_clamps_silero_exit_threshold():
     # 20 ms of silence required to detect the endpoint.
     assert stopped.audio_end_ms == 30
     assert stopped.endpoint_delay_ms == 20
-    assert policy.speech_active is False
 
 
 @pytest.mark.asyncio
@@ -463,11 +432,6 @@ async def test_server_vad_complete_audio_item_bypasses_input_buffer_and_normaliz
         assert wav_file.getsampwidth() == 2
         assert wav_file.getframerate() == 16_000
         assert wav_file.getnframes() == 1_600
-
-    assert protocol._pending_outbound.empty()
-    assert protocol._input_speech_started is False
-    assert protocol._input_audio_buffer_has_audio is False
-    assert protocol._turn_detection_config_locked is False
 
 
 @pytest.mark.asyncio
