@@ -401,7 +401,6 @@ class SileroVADBackend:
             providers=["CPUExecutionProvider"],
             sess_options=session_options,
         )
-        self._inference_lock = threading.Lock()
         input_names = {item.name for item in self._session.get_inputs()}
         if "input" not in input_names or "sr" not in input_names or "state" not in input_names:
             raise RuntimeError(f"Unsupported Silero ONNX input contract: {sorted(input_names)}")
@@ -438,8 +437,9 @@ class SileroVADBackend:
             "state": model_state,
             "sr": np.asarray(self.sample_rate_hz, dtype=np.int64),
         }
-        with self._inference_lock:
-            output = self._session.run(None, inputs)
+        # ONNX Runtime permits concurrent Run calls on one CPU session. Stream
+        # state is explicit, so independent pipelines can safely share the session.
+        output = self._session.run(None, inputs)
         if len(output) < 2:
             raise RuntimeError("Silero ONNX model did not return probability and model state")
         probability = float(np.asarray(output[0]).reshape(-1)[0])

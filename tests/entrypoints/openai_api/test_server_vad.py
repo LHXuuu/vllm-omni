@@ -6,7 +6,9 @@ from __future__ import annotations
 import base64
 import io
 import sys
+import threading
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from math import gcd
 from types import SimpleNamespace
 
@@ -505,6 +507,7 @@ def test_silero_backend_matches_upstream_v62_streaming_contract(monkeypatch, tmp
             self.providers = providers
             self.sess_options = sess_options
             self.calls: list[dict[str, np.ndarray]] = []
+            self.run_barrier: threading.Barrier | None = None
             self.instances.append(self)
 
         def get_inputs(self) -> list[FakeInput]:
@@ -512,6 +515,8 @@ def test_silero_backend_matches_upstream_v62_streaming_contract(monkeypatch, tmp
 
         def run(self, _outputs: object, inputs: dict[str, np.ndarray]) -> list[np.ndarray]:
             self.calls.append({name: np.array(value, copy=True) for name, value in inputs.items()})
+            if self.run_barrier is not None:
+                self.run_barrier.wait(timeout=5)
             return [
                 np.asarray([[0.75]], dtype=np.float32),
                 np.full((2, 1, 128), len(self.calls), dtype=np.float32),
@@ -568,6 +573,15 @@ def test_silero_backend_matches_upstream_v62_streaming_contract(monkeypatch, tmp
         second_call["state"],
         np.full((2, 1, 128), 2, dtype=np.float32),
     )
+
+    # Independent pipeline states may enter the shared ORT session concurrently.
+    session.run_barrier = threading.Barrier(2)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(backend.infer, first_frame, backend.new_state()),
+            executor.submit(backend.infer, second_frame, backend.new_state()),
+        ]
+        assert [future.result()[0] for future in futures] == pytest.approx([0.75, 0.75])
 
 
 def test_duplex_session_owns_server_vad_prefix_and_utterance_audio():
