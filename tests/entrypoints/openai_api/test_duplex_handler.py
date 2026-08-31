@@ -1088,6 +1088,43 @@ async def test_native_realtime_protocol_rejects_conflicting_turn_detection_alias
     assert "conflicting" in ws.sent[-1]["error"]["message"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "nested_realtime_payload",
+    [False, True],
+    ids=["direct", "nested-realtime-payload"],
+)
+async def test_duplex_session_create_reports_invalid_server_vad_as_client_error(
+    nested_realtime_payload: bool,
+):
+    session_id = "sid-invalid-server-vad-config"
+    event = _session_create(session_id)
+    turn_detection = {"type": "server_vad", "threshold": 1.5}
+    if nested_realtime_payload:
+        event["session"]["extra_body"] = {
+            "realtime_session_payload": {"turn_detection": turn_detection},
+        }
+    else:
+        event["session"]["turn_detection"] = turn_detection
+
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket()
+    ws.put(event)
+
+    await handler.handle_session(ws)
+
+    assert ws.sent_types() == ["error"]
+    assert ws.sent[0]["code"] == "invalid_request_error"
+    assert ws.sent[0]["error"] == "server_vad.threshold must be a number between 0 and 1"
+    assert handler._registry.get(session_id) is None
+    assert engine.opened == []
+
+
 def test_native_duplex_handler_has_no_fixed_session_admission_cap():
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
     client_config = DuplexSessionConfig(
@@ -1466,9 +1503,7 @@ async def test_native_realtime_protocol_defaults_server_vad_pcm_to_24khz():
 @pytest.mark.parametrize("sample_rate_hz", INVALID_VALIDATED_SAMPLE_RATES)
 def test_native_realtime_protocol_validates_nested_audio_sample_rate(sample_rate_hz: object):
     with pytest.raises(ValueError, match="sample_rate_hz"):
-        NativeRealtimeSessionProtocol._parse_realtime_audio_format(
-            {"type": "audio/pcm", "rate": sample_rate_hz}
-        )
+        NativeRealtimeSessionProtocol._parse_realtime_audio_format({"type": "audio/pcm", "rate": sample_rate_hz})
 
 
 @pytest.mark.asyncio

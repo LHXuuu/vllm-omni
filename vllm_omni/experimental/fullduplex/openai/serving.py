@@ -939,7 +939,19 @@ class OmniDuplexSessionHandler(
             )
             return None
 
-        config = DuplexSessionConfig.from_event(event)
+        try:
+            config = DuplexSessionConfig.from_event(event)
+        except ValueError as exc:
+            error: dict[str, object] = {
+                "type": "error",
+                "error": str(exc),
+                "code": "invalid_request_error",
+            }
+            event_id = event.get("_realtime_event_id")
+            if isinstance(event_id, str) and event_id:
+                error["event_id"] = event_id
+            await send_json(error)
+            return None
         if config.idle_timeout_s == _DEFAULT_IDLE_TIMEOUT_S:
             config.idle_timeout_s = self._idle_timeout_s
         use_native_runtime = self._uses_serving_runtime_adapter(config)
