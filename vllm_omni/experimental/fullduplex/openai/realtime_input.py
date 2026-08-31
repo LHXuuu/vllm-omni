@@ -13,6 +13,7 @@ import numpy as np
 from vllm_omni.experimental.fullduplex.openai.audio import (
     convert_input_audio_with_rate,
     encode_float32_mono_wav_base64,
+    validate_input_sample_rate_hz,
 )
 from vllm_omni.experimental.fullduplex.openai.realtime_state import (
     REALTIME_INPUT_AUDIO_FORMATS,
@@ -917,7 +918,7 @@ class RealtimeInputTranslator:
         if not isinstance(raw_format, dict):
             return raw_format, None
         rate = raw_format.get("rate") or raw_format.get("sample_rate_hz") or raw_format.get("sample_rate")
-        sample_rate_hz = int(rate) if isinstance(rate, int | float) and rate > 0 else None
+        sample_rate_hz = validate_input_sample_rate_hz(rate) if rate is not None else None
         fmt = raw_format.get("type") or raw_format.get("format")
         if not isinstance(fmt, str):
             return raw_format, sample_rate_hz

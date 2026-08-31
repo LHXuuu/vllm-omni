@@ -57,6 +57,11 @@ from vllm_omni.experimental.fullduplex.personaplex.serving_adapter import (
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+INVALID_VALIDATED_SAMPLE_RATES = (
+    pytest.param(16_000.5, id="fractional"),
+    pytest.param(float("inf"), id="infinite"),
+    pytest.param(float("nan"), id="nan"),
+)
 
 
 def test_native_input_append_supports_explicit_session_opt_out():
@@ -1456,6 +1461,14 @@ async def test_native_realtime_protocol_defaults_server_vad_pcm_to_24khz():
     assert append["format"] == "pcm16"
     assert append["sample_rate_hz"] == 24_000
     np.testing.assert_array_equal(np.frombuffer(base64.b64decode(append["audio"]), dtype="<i2"), source)
+
+
+@pytest.mark.parametrize("sample_rate_hz", INVALID_VALIDATED_SAMPLE_RATES)
+def test_native_realtime_protocol_validates_nested_audio_sample_rate(sample_rate_hz: object):
+    with pytest.raises(ValueError, match="sample_rate_hz"):
+        NativeRealtimeSessionProtocol._parse_realtime_audio_format(
+            {"type": "audio/pcm", "rate": sample_rate_hz}
+        )
 
 
 @pytest.mark.asyncio
@@ -6371,6 +6384,38 @@ async def test_minicpmo_native_duplex_rejects_invalid_sample_rate_without_append
     assert engine.appended == []
     error = next(event for event in ws.sent if event.get("type") == "error")
     assert error["code"] == "bad_event"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sample_rate_hz", INVALID_VALIDATED_SAMPLE_RATES)
+async def test_turn_based_server_vad_rejects_invalid_direct_sample_rate_without_closing_session(
+    sample_rate_hz: object,
+):
+    backend = FakeServerVADBackend([0.9])
+    handler = OmniDuplexSessionHandler(
+        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+        server_vad_backend_provider=FakeServerVADProvider(backend),
+    )
+    ws = TimedWebSocket()
+    session_create = _session_create("sid-server-vad-invalid-rate")
+    session_create["session"]["turn_detection"] = _server_vad_turn_detection(create_response=False)
+    ws.put(session_create)
+    invalid_append = _server_vad_audio_append(frame_count=1)
+    invalid_append["sample_rate_hz"] = sample_rate_hz
+    ws.put(invalid_append)
+    ws.put(_server_vad_audio_append(frame_count=1))
+    ws.put({"type": "session.close"})
+
+    await handler.handle_session(ws)
+
+    errors = [event for event in ws.sent if event.get("type") == "error"]
+    assert [error["code"] for error in errors] == ["bad_audio"]
+    assert "internal_error" not in {error["code"] for error in errors}
+    assert "session.created" in ws.sent_types()
+    assert "session.closed" in ws.sent_types()
+    assert backend.calls == 1
 
 
 @pytest.mark.asyncio

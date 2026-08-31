@@ -14,7 +14,10 @@ from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
-from vllm_omni.experimental.fullduplex.openai.audio import convert_input_audio_with_rate
+from vllm_omni.experimental.fullduplex.openai.audio import (
+    convert_input_audio_with_rate,
+    validate_input_sample_rate_hz,
+)
 from vllm_omni.experimental.fullduplex.openai.commit_policy import (
     CommitAction,
     CommitSnapshot,
@@ -1583,7 +1586,7 @@ class DuplexSessionRunnerMixin:
                         try:
                             if fmt != "pcm16":
                                 raise ValueError("server_vad input must be mono PCM16")
-                            source_sample_rate_hz = int(sample_rate_hz)
+                            source_sample_rate_hz = validate_input_sample_rate_hz(sample_rate_hz)
                             if source_sample_rate_hz not in {16_000, 24_000}:
                                 raise ValueError("server_vad PCM16 input sample rate must be 16000 or 24000 Hz")
                             if (
