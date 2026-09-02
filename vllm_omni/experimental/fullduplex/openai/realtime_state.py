@@ -70,6 +70,9 @@ REALTIME_ERROR_TYPES_BY_CODE = {
     "server_vad_manual_commit_unsupported": "invalid_request_error",
     "missing_item_id": "invalid_request_error",
     "item_not_found": "invalid_request_error",
+    "playback_item_mismatch": "invalid_request_error",
+    "playback_item_not_found": "invalid_request_error",
+    "playback_ack_too_late": "invalid_request_error",
     "unsupported_audio_format": "invalid_request_error",
     "unsupported_ref_audio_path": "invalid_request_error",
     "ref_audio_required": "invalid_request_error",
@@ -127,6 +130,17 @@ class RealtimeSessionState:
     _input_sample_rate_hz: int = REALTIME_PCM_DEFAULT_SAMPLE_RATE_HZ
     _output_audio_format: str = "pcm16"
     _overlap_silence_rms: float = 0.003
+    _turn_detection: dict[str, object] | None = None
+    _pending_turn_detection_update: (
+        tuple[
+            bool,
+            bool,
+            dict[str, object] | None,
+            asyncio.Event,
+            tuple[str, int, str, int | None, float],
+        ]
+        | None
+    ) = None
     _send_realtime_json: Any = None
     _initial_session_update: bool = False
     _input_speech_started: bool = False
@@ -143,7 +157,6 @@ class RealtimeSessionState:
     _input_audio_buffer_had_non_speech: bool = False
     _input_audio_buffer_transcript_parts: list[str] = field(default_factory=list)
     _turn_detection_configured: bool = False
-    _turn_detection: dict[str, object] | None = None
 
     @classmethod
     def from_query_params(cls, query_params: Any) -> RealtimeSessionState:
@@ -204,6 +217,17 @@ class RealtimeStateOwner:
     _input_sample_rate_hz: int = _RealtimeStateField()
     _output_audio_format: str = _RealtimeStateField()
     _overlap_silence_rms: float = _RealtimeStateField()
+    _turn_detection: dict[str, object] | None = _RealtimeStateField()
+    _pending_turn_detection_update: (
+        tuple[
+            bool,
+            bool,
+            dict[str, object] | None,
+            asyncio.Event,
+            tuple[str, int, str, int | None, float],
+        ]
+        | None
+    ) = _RealtimeStateField()
     _send_realtime_json: Any = _RealtimeStateField()
     _initial_session_update: bool = _RealtimeStateField()
     _input_speech_started: bool = _RealtimeStateField()
@@ -220,4 +244,3 @@ class RealtimeStateOwner:
     _input_audio_buffer_had_non_speech: bool = _RealtimeStateField()
     _input_audio_buffer_transcript_parts: list[str] = _RealtimeStateField()
     _turn_detection_configured: bool = _RealtimeStateField()
-    _turn_detection: dict[str, object] | None = _RealtimeStateField()

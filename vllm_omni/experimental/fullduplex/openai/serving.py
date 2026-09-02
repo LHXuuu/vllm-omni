@@ -7,7 +7,7 @@ import inspect
 import json
 from collections.abc import Mapping, MutableMapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -51,6 +51,8 @@ from vllm_omni.experimental.fullduplex.openai.runtime_bridge import (
     NativeRuntimeBridgeMixin,
 )
 from vllm_omni.experimental.fullduplex.openai.server_vad import (
+    SILERO_VAD_DEFAULT_MIN_SPEECH_DURATION_MS,
+    SILERO_VAD_MIN_THRESHOLD,
     ServerVADPipeline,
     SileroVADBackendProvider,
     SpeechDetectorBackendProvider,
@@ -516,6 +518,22 @@ class OmniDuplexSessionHandler(
             # playback only controls history ACKs, not model admission.
             if is_speech:
                 session.accumulate_overlap_speech(duration_ms)
+            vad_speech_started = self._vad_speech_started(event, payload)
+            if (
+                self._uses_native_input_append(session)
+                and session.capabilities.supports_barge_in
+                and is_speech
+                and session.config.overlap_policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+                and vad_speech_started is not False
+            ):
+                return {
+                    "action": "barge_in",
+                    "reason": ("server_vad_speech_started" if vad_speech_started is True else "barge_in_on_speech"),
+                    "cancel_reason": "turn_detected" if vad_speech_started is True else "barge_in",
+                    "duration_ms": duration_ms,
+                    "overlap_speech_ms": session.overlap_speech_ms,
+                    "buffer_audio": True,
+                }
             return {
                 "action": "listen",
                 "reason": "auto_response_continuous",
@@ -523,7 +541,7 @@ class OmniDuplexSessionHandler(
                 "overlap_speech_ms": session.overlap_speech_ms,
                 "buffer_audio": True,
                 "defer_runtime_append": False,
-                "force_listen": False,
+                "force_listen": event.get("force_listen") is True or payload.get("force_listen") is True,
                 "preserve_realtime_input": True,
             }
         if bool(event.get("force_listen", False)):
@@ -575,9 +593,22 @@ class OmniDuplexSessionHandler(
 
         session.accumulate_overlap_speech(duration_ms)
         if policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value:
+            vad_speech_started = self._vad_speech_started(event, payload)
+            if vad_speech_started is False:
+                return {
+                    "action": "listen",
+                    "reason": "server_vad_utterance_active",
+                    "duration_ms": duration_ms,
+                    "overlap_speech_ms": session.overlap_speech_ms,
+                    "buffer_audio": True,
+                    "defer_runtime_append": False,
+                    "force_listen": True,
+                    "preserve_realtime_input": True,
+                }
             return {
                 "action": "barge_in",
-                "reason": "policy_barge_in_on_speech",
+                "reason": ("server_vad_speech_started" if vad_speech_started is True else "policy_barge_in_on_speech"),
+                "cancel_reason": "turn_detected" if vad_speech_started is True else "barge_in",
                 "duration_ms": duration_ms,
                 "overlap_speech_ms": session.overlap_speech_ms,
                 "buffer_audio": True,
@@ -620,6 +651,17 @@ class OmniDuplexSessionHandler(
             "buffer_audio": True,
             "defer_runtime_append": True,
         }
+
+    @staticmethod
+    def _vad_speech_started(
+        event: Mapping[str, object],
+        payload: Mapping[str, object],
+    ) -> bool | None:
+        for source in (event, payload):
+            vad = source.get("vad")
+            if isinstance(vad, Mapping) and isinstance(vad.get("speech_started"), bool):
+                return bool(vad["speech_started"])
+        return None
 
     @staticmethod
     def _event_requests_barge_in(event: Mapping[str, object]) -> bool:
@@ -837,21 +879,25 @@ class OmniDuplexSessionHandler(
         *,
         session: DuplexSession,
     ) -> bool:
-        for key in ("is_speech", "speech"):
-            value = event.get(key)
-            if isinstance(value, bool):
-                return value
-        vad = event.get("vad")
-        if isinstance(vad, dict):
-            value = vad.get("is_speech")
-            if isinstance(value, bool):
-                return value
-            probability = vad.get("speech_probability", vad.get("probability"))
+        # Prefer serving-derived fields in ``payload`` over optional client
+        # hints retained in ``event``. In server-VAD mode the pipeline, rather
+        # than the client or the RMS fallback below, owns speech classification.
+        for source in (payload, event):
+            for key in ("is_speech", "speech"):
+                value = source.get(key)
+                if isinstance(value, bool):
+                    return value
+            vad = source.get("vad")
+            if isinstance(vad, dict):
+                value = vad.get("is_speech")
+                if isinstance(value, bool):
+                    return value
+                probability = vad.get("speech_probability", vad.get("probability"))
+                if isinstance(probability, int | float):
+                    return float(probability) >= 0.5
+            probability = source.get("speech_probability")
             if isinstance(probability, int | float):
                 return float(probability) >= 0.5
-        probability = event.get("speech_probability")
-        if isinstance(probability, int | float):
-            return float(probability) >= 0.5
 
         fmt = payload.get("format")
         audio = payload.get("audio")
@@ -961,19 +1007,6 @@ class OmniDuplexSessionHandler(
             if use_native_runtime and runtime_adapter is not None
             else None
         )
-        if (
-            runtime_capabilities is not None
-            and getattr(runtime_capabilities, "implementation_level", None) == "model_native_duplex"
-            and getattr(runtime_capabilities, "supports_input_append", False)
-            and config.server_vad is not None
-        ):
-            session_id = event.get("session_id") if isinstance(event.get("session_id"), str) else None
-            error = self._unsupported_native_server_vad_error(session_id)
-            event_id = event.get("_realtime_event_id")
-            if isinstance(event_id, str) and event_id:
-                error["event_id"] = event_id
-            await send_json(error)
-            return None
         runtime_config: dict[str, object] = {}
         if use_native_runtime and runtime_adapter is not None:
             try:
@@ -1235,9 +1268,49 @@ class OmniDuplexSessionHandler(
         candidate_config: DuplexSessionConfig,
     ) -> dict[str, object] | None:
         if not self._uses_native_input_append(session):
-            return None
+            if (
+                candidate_config.server_vad is not None
+                and candidate_config.server_vad.min_speech_duration_ms is not None
+            ):
+                return {
+                    "type": "error",
+                    "code": "unsupported_turn_detection",
+                    "error": "server_vad.min_speech_duration_ms is only supported by model-native duplex runtimes",
+                }
+            requests_interruption = (
+                candidate_config.server_vad is not None and candidate_config.server_vad.interrupt_response
+            ) or candidate_config.overlap_policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+            if not requests_interruption:
+                return None
+            return {
+                "type": "error",
+                "code": "server_vad_requires_native_duplex",
+                "error": "Realtime server_vad interruption requires a model-native duplex runtime",
+            }
         if candidate_config.server_vad is not None:
-            return self._unsupported_native_server_vad_error(session.session_id)
+            if not candidate_config.server_vad.interrupt_response:
+                return {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "code": "unsupported_turn_detection",
+                    "error": "Model-native duplex server_vad requires interrupt_response=true",
+                }
+            if candidate_config.server_vad.threshold <= SILERO_VAD_MIN_THRESHOLD:
+                return {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "code": "unsupported_turn_detection",
+                    "error": (
+                        f"Model-native duplex server_vad.threshold must be greater than {SILERO_VAD_MIN_THRESHOLD}"
+                    ),
+                }
+            if not candidate_config.server_vad.create_response:
+                return {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "code": "unsupported_turn_detection",
+                    "error": "Model-native duplex server_vad requires create_response=true",
+                }
         if (
             candidate_config.instructions != session.config.instructions
             and self._runtime_session_state(session).native_context_locked
@@ -1268,20 +1341,6 @@ class OmniDuplexSessionHandler(
             and session.capabilities.supports_input_append
             and session.config.extra_body.get("minicpmo45_native_duplex") is not False
         )
-
-    @staticmethod
-    def _unsupported_native_server_vad_error(session_id: str | None = None) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "type": "error",
-            "code": "unsupported_turn_detection",
-            "error": (
-                "server_vad is not supported for model-native duplex sessions; "
-                "omit turn_detection to use model-native turn detection"
-            ),
-        }
-        if session_id is not None:
-            payload["session_id"] = session_id
-        return payload
 
     @staticmethod
     def _config_requests_audio_output(config: DuplexSessionConfig) -> bool:
@@ -1402,8 +1461,11 @@ class OmniDuplexSessionHandler(
             payload["item_id"] = item_id
         return payload
 
-    @staticmethod
-    def _apply_session_update(session: DuplexSession, payload: dict[str, object]) -> dict[str, object] | None:
+    def _apply_session_update(
+        self,
+        session: DuplexSession,
+        payload: dict[str, object],
+    ) -> dict[str, object] | None:
         model = payload.get("model")
         audio_config = payload.get("audio")
         audio_input = audio_config.get("input") if isinstance(audio_config, dict) else None
@@ -1436,16 +1498,20 @@ class OmniDuplexSessionHandler(
             }
         extra_body_payload = payload.get("extra_body")
         if isinstance(extra_body_payload, dict) and "minicpmo45_native_duplex" in extra_body_payload:
-            current_native_duplex = session.config.extra_body.get("minicpmo45_native_duplex")
-            if (
-                current_native_duplex is not None
-                and extra_body_payload["minicpmo45_native_duplex"] != current_native_duplex
-            ):
+            requested_native_duplex = extra_body_payload["minicpmo45_native_duplex"]
+            if not isinstance(requested_native_duplex, bool):
+                return {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "code": "invalid_request_error",
+                    "error": "extra_body.minicpmo45_native_duplex must be a boolean",
+                }
+            if requested_native_duplex != self._uses_native_input_append(session):
                 return {
                     "type": "error",
                     "session_id": session.session_id,
                     "code": "native_duplex_mode_update_unsupported",
-                    "error": "session.update cannot change minicpmo45_native_duplex after the session is created",
+                    "error": "session.update cannot change the bound duplex execution mode",
                 }
         if isinstance(payload.get("instructions"), str):
             session.config.instructions = str(payload["instructions"])
@@ -1555,8 +1621,10 @@ class OmniDuplexSessionHandler(
         try:
             turn_detection_configured, server_vad = parse_session_turn_detection(payload)
             if turn_detection_configured:
-                if session.turn_detection_config_locked and (
-                    not session.config.turn_detection_configured or server_vad != session.config.server_vad
+                if (
+                    not self._uses_native_input_append(session)
+                    and session.turn_detection_config_locked
+                    and (not session.config.turn_detection_configured or server_vad != session.config.server_vad)
                 ):
                     return {
                         "type": "error",
@@ -1604,10 +1672,14 @@ class OmniDuplexSessionHandler(
     ) -> ServerVADPipeline | None:
         if config.server_vad is None:
             return None
-        if self._uses_native_input_append(session):
-            raise RuntimeError(self._unsupported_native_server_vad_error()["error"])
         backend = await asyncio.to_thread(self._server_vad_backend_provider.get)
-        return ServerVADPipeline(backend, config.server_vad)
+        pipeline_config = config.server_vad
+        if self._uses_native_input_append(session) and pipeline_config.min_speech_duration_ms is None:
+            pipeline_config = replace(
+                pipeline_config,
+                min_speech_duration_ms=SILERO_VAD_DEFAULT_MIN_SPEECH_DURATION_MS,
+            )
+        return ServerVADPipeline(backend, pipeline_config)
 
     def _apply_response_create_options(
         self,
@@ -1777,7 +1849,60 @@ class OmniDuplexSessionHandler(
         if response_id is None and item_id is None and session.active_response_id is not None:
             response_id = session.active_response_id
             item_id = f"item_{response_id}"
-        if event.get("truncate") is True:
+        if response_id is not None:
+            expected_item_id = f"item_{response_id}"
+            if item_id is None:
+                item_id = expected_item_id
+            elif item_id != expected_item_id:
+                await send_json(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "code": "playback_item_mismatch",
+                        "error": "playback.ack item_id must match item_<response_id>.",
+                    }
+                )
+                return
+            if not session.has_assistant_response_item(response_id, item_id):
+                await send_json(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "code": "playback_item_not_found",
+                        "error": f"No assistant response item is registered for {response_id}.",
+                    }
+                )
+                return
+            if session.playback_ack_is_too_late(response_id, item_id):
+                await send_json(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "code": "playback_ack_too_late",
+                        "error": "playback.ack arrived after a later user input was committed.",
+                    }
+                )
+                return
+            # Reserve the response's current history position before any later
+            # input commit can append a user item.  A 0 ms ACK is intentional:
+            # the response may be active but have no audio delta yet.
+            session.reserve_history_item(item_id)
+        elif item_id is not None:
+            await send_json(
+                {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "code": "playback_item_not_found",
+                    "error": "playback.ack requires a response-owned assistant item.",
+                }
+            )
+            return
+        hard_truncate = event.get("truncate") is True
+        if hard_truncate:
             playback = session.acknowledge_playback(
                 int(played_ms),
                 committed_cursor,
@@ -1795,10 +1920,21 @@ class OmniDuplexSessionHandler(
             )
         committed_history = False
         if isinstance(item_id, str) and item_id:
+            expected_item_id = f"item_{response_id}" if response_id is not None else None
+            if (
+                expected_item_id == item_id
+                and item_id not in session.history_item_ids
+                and item_id not in session.pending_history_item_ids
+            ):
+                # ACK_ONLY responses are normally registered as pending when
+                # the response ends. Recover the response-local item if that
+                # registration was lost across the response/ack boundary.
+                session.register_history_item(item_id, None)
             committed_history = session.truncate_history_item(
                 item_id,
                 audio_end_ms=committed_cursor,
                 playback=playback,
+                hard=hard_truncate,
             )
         elif session.pending_history_item_ids:
             # A plain playback ack has no OpenAI item id. Commit the only
@@ -1811,6 +1947,7 @@ class OmniDuplexSessionHandler(
                     item_id,
                     audio_end_ms=committed_cursor,
                     playback=playback,
+                    hard=hard_truncate,
                 )
         elif session.active_response_id is not None:
             item_id = f"item_{session.active_response_id}"
@@ -1818,6 +1955,7 @@ class OmniDuplexSessionHandler(
                 item_id,
                 audio_end_ms=committed_cursor,
                 playback=playback,
+                hard=hard_truncate,
             )
         elif session.last_assistant_full_message is not None:
             if item_id is None and session.history_item_ids:
@@ -1833,6 +1971,7 @@ class OmniDuplexSessionHandler(
                     item_id,
                     audio_end_ms=committed_cursor,
                     playback=playback,
+                    hard=hard_truncate,
                 )
         await send_json(
             {
@@ -1849,6 +1988,7 @@ class OmniDuplexSessionHandler(
         )
         if committed_history and committed_cursor >= max(playback.sent_ms, playback.generated_ms):
             session.release_response_playback(response_id)
+            session.release_response_history_snapshot(response_id)
 
     async def _cancel_active_response(
         self,
@@ -1875,7 +2015,7 @@ class OmniDuplexSessionHandler(
             item_id = f"item_{old_response_id}"
             if committed_message is not None:
                 session.register_history_item(item_id, committed_message)
-            elif committed_ms > 0:
+            elif committed_ms > 0 and not session.playback_ack_is_too_late(old_response_id, item_id):
                 session.truncate_history_item(item_id, audio_end_ms=committed_ms)
         new_epoch, old_playback = self._advance_barge_in_epoch(session)
         if old_request_id is not None:

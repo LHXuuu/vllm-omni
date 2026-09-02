@@ -650,7 +650,6 @@ class TestSingleStageInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=stage_id_filter,
             omni_master_address="127.0.0.1",
@@ -882,7 +881,6 @@ class TestSingleStageInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
         )
         mocker.patch.object(runtime_mod, "prepare_engine_environment")
@@ -935,7 +933,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1003,7 +1000,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1025,7 +1021,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1077,7 +1072,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1143,7 +1137,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=4,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1195,7 +1188,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=4,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1216,7 +1208,7 @@ class TestSingleStageReplicaInitialization:
         runtime._init_visible_devices_baseline = "0"
 
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
-        od_config = SimpleNamespace(max_num_seqs=None, parallel_config=SimpleNamespace(world_size=1))
+        od_config = SimpleNamespace(max_num_seqs=4, parallel_config=SimpleNamespace(world_size=1))
         mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value=od_config)
         mock_register = mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
@@ -1253,7 +1245,7 @@ class TestSingleStageReplicaInitialization:
                 os.environ[device_env_var] = prev_device_env
 
         assert result is sentinel_client
-        assert od_config.max_num_seqs is None
+        assert od_config.max_num_seqs == 4
         mock_register.assert_called_once_with(
             omni_master_address="127.0.0.1",
             omni_master_port=25000,
@@ -1278,9 +1270,49 @@ class TestSingleStageReplicaInitialization:
             request_address="tcp://127.0.0.1:26002",
             response_address="tcp://127.0.0.1:26003",
             proc_manager=mocker.ANY,
-            batch_size=4,
         )
         assert mock_from_addresses.call_args.kwargs["proc_manager"].proc is proc
+
+    def test_initialize_local_custom_diffusion_replica_uses_inline_client(self, mocker: MockerFixture):
+        import vllm_omni.engine.stage_runtime as runtime_mod
+        from vllm_omni.platforms import current_omni_platform
+
+        runtime = DistStageRuntime(
+            stage_configs=[],
+            model="fake-model",
+            config_path="/fake/stages.yaml",
+            stage_init_timeout=60,
+            async_chunk=False,
+            single_stage_id_filter=None,
+            omni_master_address="127.0.0.1",
+            omni_master_port=26000,
+        )
+        runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
+        runtime._coordinator_runtime = None
+        plan = _make_diffusion_plan(0, stage_id=0, launch_mode="local").replicas[0]
+        plan.stage_cfg.engine_args = {"custom_pipeline_args": {"pipeline_class": "test.CustomPipeline"}}
+        sentinel_client = SimpleNamespace()
+        mock_launch = mocker.patch.object(
+            runtime_mod,
+            "launch_diffusion_stage_replica",
+            return_value=(sentinel_client, StageReplicaResources()),
+        )
+        mocker.patch.object(runtime_mod, "inject_kv_stage_info")
+
+        device_env_var = current_omni_platform.device_control_env_var
+        prev_device_env = os.environ.get(device_env_var)
+        os.environ[device_env_var] = "0"
+        runtime._init_visible_devices_baseline = "0"
+        try:
+            result = runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=60)
+        finally:
+            if prev_device_env is None:
+                os.environ.pop(device_env_var, None)
+            else:
+                os.environ[device_env_var] = prev_device_env
+
+        assert result is sentinel_client
+        assert mock_launch.call_args.kwargs["use_inline"] is True
 
     def test_initialize_local_diffusion_replica_failure_terminates_proc(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod
@@ -1291,7 +1323,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=4,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",

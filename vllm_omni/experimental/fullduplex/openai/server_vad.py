@@ -15,12 +15,14 @@ from typing import Literal, Protocol
 import numpy as np
 from vllm.transformers_utils.repo_utils import try_get_local_file
 
-from vllm_omni.experimental.fullduplex.openai.audio import _StreamingPCM16MonoResampler
+from vllm_omni.entrypoints.openai.audio_utils_mixin import StreamingAudioResampler
 
 SILERO_VAD_REPO_ID = "istupakov/silero-vad-onnx"
 SILERO_VAD_REVISION = "8b14476858ef240c50b3884bb38cc67290c1cc70"
 SILERO_VAD_FILENAME = "silero_vad.onnx"
 SILERO_VAD_SHA256 = "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+SILERO_VAD_MIN_THRESHOLD = 0.15
+SILERO_VAD_DEFAULT_MIN_SPEECH_DURATION_MS = 96
 
 _SERVER_VAD_FIELDS = {
     "type",
@@ -29,6 +31,7 @@ _SERVER_VAD_FIELDS = {
     "silence_duration_ms",
     "create_response",
     "interrupt_response",
+    "min_speech_duration_ms",
 }
 
 
@@ -41,7 +44,8 @@ class ServerVADConfig:
     prefix_padding_ms: int = 300
     silence_duration_ms: int = 500
     create_response: bool = True
-    interrupt_response: bool = False
+    interrupt_response: bool = True
+    min_speech_duration_ms: int | None = None
 
     @classmethod
     def from_value(cls, value: object) -> ServerVADConfig:
@@ -74,11 +78,18 @@ class ServerVADConfig:
         if not isinstance(create_response, bool):
             raise ValueError("server_vad.create_response must be a boolean")
 
-        interrupt_response = value.get("interrupt_response", False)
+        interrupt_response = value.get("interrupt_response", True)
         if not isinstance(interrupt_response, bool):
             raise ValueError("server_vad.interrupt_response must be a boolean")
-        if interrupt_response:
-            raise ValueError("server_vad.interrupt_response=true is not supported")
+
+        min_speech_duration_ms = value.get("min_speech_duration_ms")
+        if min_speech_duration_ms is not None and (
+            isinstance(min_speech_duration_ms, bool)
+            or not isinstance(min_speech_duration_ms, int | float)
+            or not np.isfinite(float(min_speech_duration_ms))
+            or min_speech_duration_ms < 0
+        ):
+            raise ValueError("server_vad.min_speech_duration_ms must be a non-negative number")
 
         return cls(
             type=vad_type,
@@ -86,11 +97,12 @@ class ServerVADConfig:
             prefix_padding_ms=prefix_padding_ms,
             silence_duration_ms=silence_duration_ms,
             create_response=create_response,
-            interrupt_response=False,
+            interrupt_response=interrupt_response,
+            min_speech_duration_ms=(int(min_speech_duration_ms) if min_speech_duration_ms is not None else None),
         )
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "type": self.type,
             "threshold": self.threshold,
             "prefix_padding_ms": self.prefix_padding_ms,
@@ -98,6 +110,9 @@ class ServerVADConfig:
             "create_response": self.create_response,
             "interrupt_response": self.interrupt_response,
         }
+        if self.min_speech_duration_ms is not None:
+            result["min_speech_duration_ms"] = self.min_speech_duration_ms
+        return result
 
 
 def parse_session_turn_detection(
@@ -169,6 +184,8 @@ class ThresholdEndpointPolicy:
         self.config = config
         self.sample_rate_hz = sample_rate_hz
         self._speech_active = False
+        self._candidate_samples = 0
+        self._candidate_start_sample: int | None = None
         self._silence_samples = 0
 
     @property
@@ -185,8 +202,20 @@ class ThresholdEndpointPolicy:
         if probability >= self.config.threshold:
             self._silence_samples = 0
             if not self._speech_active:
+                if self._candidate_samples == 0:
+                    self._candidate_start_sample = frame_start_sample
+                self._candidate_samples += frame_samples
+                min_speech_duration_ms = self.config.min_speech_duration_ms or 0
+                min_speech_samples = max(1, round(min_speech_duration_ms * self.sample_rate_hz / 1000))
+                if self._candidate_samples < min_speech_samples:
+                    return SpeechEndpointDecision()
                 self._speech_active = True
-                detected_start_ms = round(frame_start_sample * 1000 / self.sample_rate_hz)
+                detected_start_sample = (
+                    self._candidate_start_sample if self._candidate_start_sample is not None else frame_start_sample
+                )
+                detected_start_ms = round(detected_start_sample * 1000 / self.sample_rate_hz)
+                self._candidate_samples = 0
+                self._candidate_start_sample = None
                 return SpeechEndpointDecision(
                     speech_started=True,
                     audio_start_ms=max(0, detected_start_ms - self.config.prefix_padding_ms),
@@ -194,6 +223,8 @@ class ThresholdEndpointPolicy:
             return SpeechEndpointDecision()
 
         if not self._speech_active:
+            self._candidate_samples = 0
+            self._candidate_start_sample = None
             return SpeechEndpointDecision()
 
         # Match Silero v6.2's streaming VAD hysteresis: activation uses the
@@ -201,7 +232,7 @@ class ThresholdEndpointPolicy:
         # ``max(threshold - 0.15, 0.01)``. Once a silence candidate exists,
         # intermediate frames keep elapsed time moving but cannot themselves
         # close the turn.
-        negative_threshold = max(self.config.threshold - 0.15, 0.01)
+        negative_threshold = max(self.config.threshold - SILERO_VAD_MIN_THRESHOLD, 0.01)
         below_negative_threshold = probability < negative_threshold
         if not below_negative_threshold and self._silence_samples == 0:
             return SpeechEndpointDecision()
@@ -226,6 +257,8 @@ class ThresholdEndpointPolicy:
 
     def reset(self) -> None:
         self._speech_active = False
+        self._candidate_samples = 0
+        self._candidate_start_sample = None
         self._silence_samples = 0
 
 
@@ -264,7 +297,7 @@ class ServerVADPipeline:
             config,
             sample_rate_hz=self.sample_rate_hz,
         )
-        self._input_resampler: _StreamingPCM16MonoResampler | None = None
+        self._input_resampler: StreamingAudioResampler | None = None
         self._source_sample_rate_hz: int | None = None
         self._scratch = np.empty(0, dtype=np.float32)
         self._detector_state = backend.new_state()
@@ -311,16 +344,13 @@ class ServerVADPipeline:
             input_resampler = (
                 None
                 if source_sample_rate_hz == self.sample_rate_hz
-                else _StreamingPCM16MonoResampler(
-                    source_rate_hz=source_sample_rate_hz,
-                    target_rate_hz=self.sample_rate_hz,
-                )
+                else StreamingAudioResampler(source_sample_rate_hz, self.sample_rate_hz)
             )
             self._source_sample_rate_hz = source_sample_rate_hz
             self._input_resampler = input_resampler
 
         if self._input_resampler is not None:
-            normalized = self._input_resampler.push(pcm16)
+            normalized = self._input_resampler.process(pcm16.astype(np.float32) * np.float32(1.0 / 32768.0))
         else:
             normalized = np.ascontiguousarray(pcm16, dtype=np.float32) / np.float32(32768.0)
         return await self.push(normalized)

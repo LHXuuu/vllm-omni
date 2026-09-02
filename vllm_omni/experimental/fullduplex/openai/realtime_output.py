@@ -41,6 +41,7 @@ class RealtimeOutputProjector:
             if isinstance(item_id, str):
                 self._active_input_item_id = item_id
             self._input_speech_started = True
+            self._input_audio_buffer_has_audio = True
             return [
                 {
                     "type": "input_audio_buffer.speech_started",
@@ -286,15 +287,8 @@ class RealtimeOutputProjector:
                         content_index=0,
                         audio_end_ms=committed_audio_ms,
                     )
-                payloads.append(
-                    {
-                        "type": "conversation.item.truncated",
-                        "item_id": item_id,
-                        "content_index": 0,
-                        "audio_end_ms": committed_audio_ms,
-                        "event": event,
-                    }
-                )
+                # Align server history with acknowledged playback; only explicit
+                # client truncation emits ``conversation.item.truncated``.
             payloads.extend(self._realtime_audio_done_events(event, response_id))
             payloads.extend(
                 self._realtime_response_terminal_events(
@@ -446,7 +440,7 @@ class RealtimeOutputProjector:
                 self._realtime_error_payload(
                     code,
                     message,
-                    event_id=event.get("event_id"),
+                    event_id=event.get("realtime_event_id") or event.get("event_id"),
                     param=event.get("param"),
                 )
             ]

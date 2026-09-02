@@ -743,6 +743,7 @@ async def test_complete_audio_item_preserves_explicit_manual_commit_translation(
     )
     session_create = json.loads(await protocol.receive_internal_event_text(ws))
     assert session_create["type"] == "session.create"
+    protocol.commit_realtime_turn_detection_update()
 
     pcm16 = np.full(320, 8_192, dtype="<i2")
     ws.put(
@@ -925,7 +926,7 @@ async def test_native_realtime_protocol_preserves_input_turn_policy_hints():
 
 
 @pytest.mark.asyncio
-async def test_native_realtime_protocol_accepts_server_vad():
+async def test_realtime_protocol_accepts_turn_based_server_vad():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     protocol.bind_sender(ws.send_json)
@@ -946,6 +947,7 @@ async def test_native_realtime_protocol_accepts_server_vad():
     )
 
     assert translated is not None
+    protocol.commit_realtime_turn_detection_update()
     config = DuplexSessionConfig.from_event(translated)
     assert config.server_vad is not None
     assert config.server_vad.threshold == 0.4
@@ -976,7 +978,7 @@ async def test_native_realtime_protocol_accepts_server_vad():
 
 
 @pytest.mark.asyncio
-async def test_native_realtime_protocol_rejects_manual_commit_with_server_vad():
+async def test_realtime_protocol_rejects_manual_commit_with_turn_based_server_vad():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     protocol.bind_sender(ws.send_json)
@@ -985,10 +987,11 @@ async def test_native_realtime_protocol_rejects_manual_commit_with_server_vad():
         {
             "type": "session.update",
             "model": "test-model",
-            "turn_detection": {"type": "server_vad"},
+            "turn_detection": {"type": "server_vad", "interrupt_response": False},
         }
     )
     assert translated is not None
+    protocol.commit_realtime_turn_detection_update()
 
     audio = base64.b64encode(np.zeros(320, dtype="<i2").tobytes()).decode()
     append = await protocol._to_duplex_event(
@@ -1038,6 +1041,50 @@ async def test_native_realtime_protocol_accepts_disabled_turn_detection():
     assert translated["type"] == "session.create"
     assert translated["session"]["extra_body"]["realtime_session_payload"]["turn_detection"] is None
 
+
+@pytest.mark.asyncio
+async def test_rejected_session_update_never_exposes_candidate_protocol_audio_config():
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    protocol.bind_sender(ws.send_json)
+
+    initial = await protocol._to_duplex_event(
+        {
+            "type": "session.update",
+            "session": {
+                "model": "test-model",
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 16_000},
+                        "turn_detection": None,
+                    }
+                },
+            },
+        }
+    )
+    assert initial is not None
+    protocol.commit_realtime_turn_detection_update()
+    assert protocol._input_sample_rate_hz == 16_000
+
+    candidate = await protocol._to_duplex_event(
+        {
+            "type": "session.update",
+            "session": {
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24_000},
+                    }
+                },
+            },
+        }
+    )
+    assert candidate is not None
+    assert protocol._input_sample_rate_hz == 16_000
+    assert protocol.pending_realtime_input_audio_config_changed()
+
+    protocol.reject_realtime_turn_detection_update()
+
+    assert protocol._input_sample_rate_hz == 16_000
     updated = protocol._from_duplex_event(
         {
             "type": "session.updated",
@@ -1470,7 +1517,7 @@ def test_native_realtime_protocol_projects_input_commit_in_openai_order():
 
 
 @pytest.mark.asyncio
-async def test_native_realtime_protocol_defaults_server_vad_pcm_to_24khz():
+async def test_native_realtime_protocol_defaults_turn_based_server_vad_pcm_to_24khz():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     protocol.bind_sender(ws.send_json)
@@ -1480,11 +1527,19 @@ async def test_native_realtime_protocol_defaults_server_vad_pcm_to_24khz():
             "type": "session.update",
             "session": {
                 "model": "test-model",
-                "audio": {"input": {"turn_detection": {"type": "server_vad"}}},
+                "audio": {
+                    "input": {
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "interrupt_response": False,
+                        }
+                    }
+                },
             },
         }
     )
     assert translated is not None
+    protocol.commit_realtime_turn_detection_update()
 
     source = np.arange(240, dtype="<i2")
     append = await protocol._to_duplex_event(
@@ -1498,6 +1553,83 @@ async def test_native_realtime_protocol_defaults_server_vad_pcm_to_24khz():
     assert append["format"] == "pcm16"
     assert append["sample_rate_hz"] == 24_000
     np.testing.assert_array_equal(np.frombuffer(base64.b64decode(append["audio"]), dtype="<i2"), source)
+
+
+@pytest.mark.parametrize(("initial_rate_hz", "updated_rate_hz"), [(16_000, 24_000), (24_000, 16_000)])
+@pytest.mark.asyncio
+async def test_turn_based_server_vad_rejects_input_rate_change_after_append(
+    initial_rate_hz: int,
+    updated_rate_hz: int,
+):
+    initial = _server_vad_session_update(_server_vad_turn_detection(create_response=False))
+    initial["session"]["audio"]["input"]["format"]["rate"] = initial_rate_hz
+    append = _server_vad_audio_append(frame_count=1)
+    append["sample_rate_hz"] = initial_rate_hz
+    append["audio"] = base64.b64encode(np.zeros(initial_rate_hz // 100, dtype="<i2").tobytes()).decode()
+    ws = TimedWebSocket()
+    ws.put(initial)
+    ws.put(append)
+    ws.put(
+        {
+            "type": "session.update",
+            "event_id": "event-rate-change",
+            "session": {
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": updated_rate_hz},
+                    }
+                }
+            },
+        }
+    )
+    ws.put({"type": "session.close"})
+    handler = OmniDuplexSessionHandler(
+        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
+        server_vad_backend_provider=FakeServerVADProvider(FakeServerVADBackend([0.0])),
+    )
+
+    await handler.handle_realtime_session(ws)  # type: ignore[arg-type]
+
+    error = next(
+        event["error"]
+        for event in ws.sent
+        if event.get("type") == "error" and event.get("error", {}).get("code") == "unsupported_audio_format"
+    )
+    assert error["event_id"] == "event-rate-change"
+
+
+@pytest.mark.asyncio
+async def test_manual_turn_based_session_allows_input_rate_update_after_append():
+    initial = _server_vad_session_update(None)
+    append = _server_vad_audio_append(frame_count=1)
+    ws = TimedWebSocket()
+    ws.put(initial)
+    ws.put(append)
+    ws.put(
+        {
+            "type": "session.update",
+            "event_id": "event-manual-rate-change",
+            "session": {
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24_000},
+                    }
+                }
+            },
+        }
+    )
+    ws.put({"type": "session.close"})
+    handler = OmniDuplexSessionHandler(
+        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
+    )
+
+    await handler.handle_realtime_session(ws)  # type: ignore[arg-type]
+
+    assert any(event.get("type") == "session.updated" for event in ws.sent)
+    assert not any(
+        event.get("type") == "error" and event.get("error", {}).get("event_id") == "event-manual-rate-change"
+        for event in ws.sent
+    )
 
 
 @pytest.mark.parametrize("sample_rate_hz", INVALID_VALIDATED_SAMPLE_RATES)
@@ -1518,7 +1650,10 @@ def test_native_realtime_protocol_validates_nested_audio_sample_rate(sample_rate
                     "audio": {
                         "input": {
                             "format": "g711_ulaw",
-                            "turn_detection": {"type": "server_vad"},
+                            "turn_detection": {
+                                "type": "server_vad",
+                                "interrupt_response": False,
+                            },
                         }
                     },
                 },
@@ -1533,14 +1668,17 @@ def test_native_realtime_protocol_validates_nested_audio_sample_rate(sample_rate
                         "input": {
                             "format": {"type": "audio/pcm", "rate": 16_000},
                             "channels": 2,
-                            "turn_detection": {"type": "server_vad"},
+                            "turn_detection": {
+                                "type": "server_vad",
+                                "interrupt_response": False,
+                            },
                         }
                     },
                 },
             }
         ],
         [
-            _server_vad_session_update({"type": "server_vad"}),
+            _server_vad_session_update(_server_vad_turn_detection()),
             {
                 "type": "session.update",
                 "session": {"audio": {"input": {"format": "g711_ulaw"}}},
@@ -1549,14 +1687,18 @@ def test_native_realtime_protocol_validates_nested_audio_sample_rate(sample_rate
     ],
     ids=["g711", "stereo", "incompatible-update"],
 )
-async def test_native_realtime_protocol_rejects_unsupported_server_vad_audio(updates: list[dict[str, Any]]):
+async def test_native_realtime_protocol_rejects_unsupported_turn_based_server_vad_audio(
+    updates: list[dict[str, Any]],
+):
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     protocol.bind_sender(ws.send_json)
 
     translated = None
-    for update in updates:
+    for index, update in enumerate(updates):
         translated = await protocol._to_duplex_event(update)
+        if translated is not None and index < len(updates) - 1:
+            protocol.commit_realtime_turn_detection_update()
 
     assert translated is None
     assert ws.sent[-1]["error"]["code"] == "unsupported_turn_detection"
@@ -1599,7 +1741,9 @@ async def test_realtime_server_vad_commits_without_client_commit(sample_rate_hz:
     # The streaming polyphase resampler retains a small amount of right
     # context. Supply it at 24 kHz so five complete 16 kHz VAD frames are
     # available without flushing the still-open input stream.
-    right_context_samples = 18 if sample_rate_hz == 24_000 else 0
+    # Give the streaming resampler enough future input to emit the final VAD
+    # frame without coupling this test to a particular FIR implementation.
+    right_context_samples = sample_rate_hz // 100 if sample_rate_hz == 24_000 else 0
     pcm16 = np.zeros((sample_rate_hz // 100) * 5 + right_context_samples, dtype="<i2")
     ws.put(
         {
@@ -1795,7 +1939,7 @@ async def test_realtime_server_vad_complete_audio_item_preserves_wire_item_and_u
 @pytest.mark.asyncio
 async def test_realtime_initial_server_vad_failure_preserves_event_id():
     ws = TimedWebSocket()
-    ws.put(_server_vad_session_update({"type": "server_vad"}, event_id="event-initial-server-vad"))
+    ws.put(_server_vad_session_update(_server_vad_turn_detection(), event_id="event-initial-server-vad"))
     handler = OmniDuplexSessionHandler(
         chat_service=TurnBasedFakeChatService(FakeEngineClient()),
         server_vad_backend_provider=FailingServerVADProvider(),
@@ -1812,10 +1956,33 @@ async def test_realtime_initial_server_vad_failure_preserves_event_id():
 
 
 @pytest.mark.asyncio
+async def test_turn_based_rejects_interrupting_server_vad_with_event_id():
+    ws = TimedWebSocket()
+    ws.put(
+        _server_vad_session_update(
+            {"type": "server_vad"},
+            event_id="event-interrupting-server-vad",
+        )
+    )
+    handler = OmniDuplexSessionHandler(
+        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
+    )
+
+    await handler.handle_realtime_session(ws)  # type: ignore[arg-type]
+
+    error = next(
+        event["error"]
+        for event in ws.sent
+        if event.get("type") == "error" and event.get("error", {}).get("code") == "server_vad_requires_native_duplex"
+    )
+    assert error["event_id"] == "event-interrupting-server-vad"
+
+
+@pytest.mark.asyncio
 async def test_realtime_server_vad_update_initialization_failure_keeps_session_open():
     ws = TimedWebSocket()
     ws.put(_server_vad_session_update(None))
-    ws.put(_server_vad_session_update({"type": "server_vad"}, event_id="event-enable-server-vad"))
+    ws.put(_server_vad_session_update(_server_vad_turn_detection(), event_id="event-enable-server-vad"))
     ws.put(_server_vad_audio_append(frame_count=1, is_speech=True))
     ws.put({"type": "input_audio_buffer.commit", "event_id": "commit-after-failed-enable"})
     ws.put(
@@ -2180,54 +2347,6 @@ async def test_realtime_output_audio_clear_rejects_non_active_response_id_withou
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("when", ["create", "update"])
-async def test_native_session_rejects_server_vad(when: str):
-    engine = FakeEngineClient()
-    handler = OmniDuplexSessionHandler(
-        chat_service=FakeChatService(engine),
-        config_timeout_s=0.1,
-        idle_timeout_s=1,
-    )
-    session_id = f"sid-native-server-vad-{when}"
-    ws = TimedWebSocket()
-    if when == "create":
-        event = _native_session_create(session_id)
-        event["session"]["turn_detection"] = {"type": "server_vad"}
-        ws.put(event)
-    else:
-        ws.put(_native_session_create(session_id))
-        ws.put(
-            {
-                "type": "turn.signal",
-                "event": "session.update",
-                "payload": {"turn_detection": {"type": "server_vad"}},
-            }
-        )
-        ws.put(
-            {
-                "type": "turn.signal",
-                "event": "session.update",
-                "payload": {"instructions": "session remains active"},
-            }
-        )
-        ws.put({"type": "session.close"})
-
-    await handler.handle_session(ws)
-
-    error = next(message for message in ws.sent if message.get("type") == "error")
-    assert error["code"] == "unsupported_turn_detection"
-    assert "model-native duplex" in error["error"]
-    if when == "create":
-        assert not engine.opened
-        assert "session.created" not in ws.sent_types()
-    else:
-        updated = next(message for message in ws.sent if message.get("type") == "session.updated")
-        assert updated["session"]["instructions"] == "session remains active"
-        assert engine.signals.count((session_id, "session.update")) == 1
-        assert "session.closed" in ws.sent_types()
-
-
-@pytest.mark.asyncio
 async def test_native_session_update_rejects_client_runtime_config():
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(
@@ -2297,6 +2416,52 @@ def test_personaplex_candidate_update_does_not_leak_minicpmo_ref_audio_check():
     error = handler._runtime_session_candidate_update_error(session, candidate_config)
 
     assert error is None
+
+
+@pytest.mark.parametrize(
+    ("native", "turn_detection", "expected_code"),
+    [
+        (False, {"type": "server_vad", "interrupt_response": False}, None),
+        (False, {"type": "server_vad"}, "server_vad_requires_native_duplex"),
+        (True, {"type": "server_vad", "interrupt_response": False}, "unsupported_turn_detection"),
+        (True, {"type": "server_vad"}, None),
+        (True, {"type": "server_vad", "threshold": 0.15}, "unsupported_turn_detection"),
+        (True, {"type": "server_vad", "create_response": False}, "unsupported_turn_detection"),
+        (False, {"type": "server_vad", "min_speech_duration_ms": 96}, "unsupported_turn_detection"),
+        (True, {"type": "server_vad", "min_speech_duration_ms": 96}, None),
+        (False, {"type": "server_vad", "interrupt_response": False, "threshold": 0.1}, None),
+    ],
+    ids=[
+        "turn-based-endpointing",
+        "turn-based-default-interruption",
+        "native-non-interrupting",
+        "native-default-interruption",
+        "native-low-threshold",
+        "native-no-auto-response",
+        "turn-based-native-extension",
+        "native-min-speech-duration",
+        "turn-based-low-threshold",
+    ],
+)
+def test_server_vad_runtime_capability_matrix(
+    native: bool,
+    turn_detection: dict[str, object],
+    expected_code: str | None,
+):
+    handler = OmniDuplexSessionHandler(
+        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
+    )
+    capabilities = DuplexCapabilities.minicpmo45_native() if native else DuplexCapabilities()
+    session = DuplexSession(
+        "sid-server-vad-capability",
+        DuplexSessionConfig(),
+        capabilities=capabilities,
+    )
+    candidate = DuplexSessionConfig.from_event({"session": {"turn_detection": turn_detection}})
+
+    error = handler._runtime_session_candidate_update_error(session, candidate)
+
+    assert (error or {}).get("code") == expected_code
 
 
 @pytest.mark.asyncio
@@ -2452,6 +2617,40 @@ async def test_minicpmo_native_session_update_rejects_native_duplex_mode_flip():
         "instructions_update_unsupported",
     ]
     assert "session.updated" not in ws.sent_types()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_value", "expected_code"),
+    [
+        (True, "native_duplex_mode_update_unsupported"),
+        (None, "invalid_request_error"),
+    ],
+)
+async def test_turn_based_session_update_rejects_native_duplex_mode_flip(
+    requested_value: object,
+    expected_code: str,
+):
+    handler = OmniDuplexSessionHandler(
+        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket()
+    ws.put(_session_create("sid-turn-based-native-flag-flip"))
+    ws.put(
+        {
+            "type": "turn.signal",
+            "event": "session.update",
+            "payload": {"extra_body": {"minicpmo45_native_duplex": requested_value}},
+        }
+    )
+    ws.put({"type": "session.close"})
+
+    await handler.handle_session(ws)
+
+    error = next(message for message in ws.sent if message.get("type") == "error")
+    assert error["code"] == expected_code
 
 
 def test_native_realtime_protocol_audio_delta_preserves_sample_rate_hz():
@@ -2808,6 +3007,14 @@ def _native_realtime_session_update(
     }
 
 
+def _native_server_vad_update(event_id: str, **session: object) -> dict[str, object]:
+    return {
+        "type": "session.update",
+        "event_id": event_id,
+        "session": {"turn_detection": {"type": "server_vad"}, **session},
+    }
+
+
 def test_native_stage0_request_id_matches_engine_after_same_session_id_reopen():
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
     first = handler._registry.create(session_id="sid-reused")
@@ -3006,6 +3213,27 @@ def test_auto_response_playback_overlap_keeps_model_owned_listen_speak_decision(
 
     session.acknowledge_playback(played_ms=1000, committed_ms=1000)
     assert handler._should_force_listen_for_auto_response_overlap(session, {}, speech_payload) is False
+
+
+def test_legacy_auto_overlap_policy_falls_back_to_listen_only():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-auto-policy-fallback",
+        config=DuplexSessionConfig(
+            overlap_policy=DuplexSessionConfig._normalize_overlap_policy("auto"),
+        ),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+
+    decision = handler._overlap_decision(
+        session,
+        {"duration_ms": session.config.overlap_barge_in_ms, "is_speech": True},
+        _native_audio_payload(is_speech=True),
+    )
+
+    assert session.config.overlap_policy == DuplexOverlapPolicy.LISTEN_ONLY.value
+    assert decision["action"] == "listen"
+    assert decision["reason"] == "policy_listen_only"
 
 
 def test_auto_response_overlap_silence_advances_model_unit_and_preserves_realtime_input():
@@ -4405,7 +4633,7 @@ async def test_minicpmo_pre_response_continuation_drops_after_model_turn_ends():
 
 
 @pytest.mark.asyncio
-async def test_minicpmo_auto_response_continuation_has_no_semantic_unit_cap():
+async def test_minicpmo_auto_response_continuation_stops_at_large_safety_boundary():
     request_id = "duplex-sid-long-response-e0-stage0"
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
@@ -4421,7 +4649,7 @@ async def test_minicpmo_auto_response_continuation_has_no_semantic_unit_cap():
     _install_direct_silence_scheduler(handler, session)
     ws = TimedWebSocket()
 
-    for _ in range(9):
+    for _ in range(handler._NATIVE_AUTO_RESPONSE_MAX_CONTINUATION_UNITS):
         await handler._maybe_continue_native_response(
             ws.send_json,
             session=session,
@@ -4429,9 +4657,160 @@ async def test_minicpmo_auto_response_continuation_has_no_semantic_unit_cap():
         )
     await asyncio.sleep(0.02)
 
-    assert len(engine.appended) == 9
+    response_id = session.active_response_id
+    assert response_id is not None
+    assert len(engine.appended) == handler._NATIVE_AUTO_RESPONSE_MAX_CONTINUATION_UNITS
     assert all(payload["duplex_turn_id"] == 0 for _, _, payload, _ in engine.appended)
-    assert all("force_speak" not in payload for _, _, payload, _ in engine.appended)
+    assert all(not {"force_speak", "force_listen"} & payload.keys() for _, _, payload, _ in engine.appended[:-1])
+    assert engine.appended[-1][2]["force_listen"] is True
+    assert handler._native_response_continuations_remaining(session, response_id) is False
+
+    await handler._maybe_continue_native_response(
+        ws.send_json,
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert len(engine.appended) == handler._NATIVE_AUTO_RESPONSE_MAX_CONTINUATION_UNITS
+    assert ws.sent_types()[-2:] == ["response.listen", "response.done"]
+    assert session.active_response_id is None
+    assert session.active_request_id == request_id
+    assert session.turn_id == 1
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_auto_response_boundary_listen_closes_response():
+    request_id = "duplex-sid-boundary-listen-e0-stage0"
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
+    session = DuplexSession(
+        session_id="sid-boundary-listen",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    response_id = session.begin_response(turn_id=0)
+    session.bind_request(request_id)
+    native = handler._minicpmo_session_state(session)
+    native.continuation_owner_id = f"response:{response_id}"
+    native.continuation_units = handler._NATIVE_AUTO_RESPONSE_MAX_CONTINUATION_UNITS
+    _install_direct_silence_scheduler(handler, session)
+    ws = TimedWebSocket()
+
+    close_reason, emitted = await handler._send_one_native_duplex_event(
+        ws.send_json,
+        {
+            "supported": True,
+            "stage_role": "llm",
+            "is_listen": True,
+            "model_listen": True,
+            "data_plane_request_id": request_id,
+            "end_of_turn": False,
+            "uses_model_runner_scheduler": True,
+            "runner_kv_backed": True,
+            "runtime_impl": "scheduler_data_plane",
+        },
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert close_reason is None
+    assert emitted is True
+    assert engine.appended == []
+    assert ws.sent_types() == ["response.listen", "response.done"]
+    assert session.active_response_id is None
+    assert session.active_request_id == request_id
+    assert session.turn_id == 1
+    assert native.continuation_owner_id is None
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_auto_response_boundary_allows_next_model_turn_response():
+    request_id = "duplex-sid-boundary-next-turn-e0-stage0"
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-boundary-next-turn",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    session.begin_response(turn_id=0)
+    session.bind_request(request_id)
+    native = handler._minicpmo_session_state(session)
+    native.continuation_owner_id = f"response:{session.active_response_id}"
+    native.continuation_units = handler._NATIVE_AUTO_RESPONSE_MAX_CONTINUATION_UNITS
+    ws = TimedWebSocket()
+
+    await handler._maybe_continue_native_response(
+        ws.send_json,
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert session.active_response_id is None
+    assert session.turn_id == 1
+
+    close_reason, emitted = await handler._send_one_native_duplex_event(
+        ws.send_json,
+        {
+            "supported": True,
+            "stage_role": "tts",
+            "is_listen": False,
+            "data_plane_request_id": request_id,
+            "text": "next response",
+            "audio_data": "next-audio",
+            "audio_format": "pcm16",
+            "audio_duration_ms": 100,
+            "end_of_turn": False,
+            "model_turn_id": 1,
+        },
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert close_reason is None
+    assert emitted is True
+    assert ws.sent_types() == [
+        "response.listen",
+        "response.done",
+        "response.created",
+        "response.speak",
+        "response.output_audio.delta",
+    ]
+    assert session.active_response_turn_id == 1
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_auto_response_boundary_does_not_close_new_epoch_response():
+    request_id = "duplex-sid-boundary-race-e0-stage0"
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-boundary-race",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    old_response_id = session.begin_response(turn_id=0)
+    session.bind_request(request_id)
+    native = handler._minicpmo_session_state(session)
+    native.continuation_owner_id = f"response:{old_response_id}"
+    native.continuation_units = handler._NATIVE_AUTO_RESPONSE_MAX_CONTINUATION_UNITS
+    sent: list[dict[str, Any]] = []
+    new_response_ids: list[str] = []
+
+    async def _barge_in_on_listen(payload: dict[str, Any]) -> None:
+        sent.append(payload)
+        if payload["type"] == "response.listen":
+            session.barge_in()
+            session.bind_request("duplex-sid-boundary-race-e1-stage0")
+            new_response_ids.append(session.begin_response(turn_id=1))
+
+    await handler._maybe_continue_native_response(
+        _barge_in_on_listen,
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert [payload["type"] for payload in sent] == ["response.listen"]
+    assert len(new_response_ids) == 1
+    assert session.active_response_id == new_response_ids[0]
 
 
 @pytest.mark.asyncio
@@ -5125,6 +5504,55 @@ async def test_duplex_chat_audio_stream_uses_output_audio_delta_event():
 
 
 @pytest.mark.asyncio
+async def test_duplex_chat_stage_metrics_use_latest_streaming_snapshot():
+    class SnapshotChatService(FakeChatService):
+        async def create_chat_completion(self, request, raw_request=None):
+            del raw_request
+            self.seen_request_ids.append(request.request_id)
+            snapshots = [
+                {"num_tokens_out": 1, "vllm_tpot_ms": 0.0, "vllm_itls_ms": []},
+                {"num_tokens_out": 2, "vllm_tpot_ms": 10.0, "vllm_itls_ms": [10.0]},
+                {"num_tokens_out": 3, "vllm_tpot_ms": 11.0, "vllm_itls_ms": [10.0, 12.0]},
+            ]
+
+            async def generate():
+                for index, snapshot in enumerate(snapshots):
+                    payload = {
+                        "modality": "audio",
+                        "choices": [{"delta": {"content": f"audio-{index}"}}],
+                        "metrics": {"stage_metrics": {"0": snapshot}},
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+
+            return generate()
+
+    handler = OmniDuplexSessionHandler(
+        chat_service=SnapshotChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-chat-snapshots",
+        config=DuplexSessionConfig(instructions="speak"),
+    )
+    sent: list[dict[str, Any]] = []
+
+    async def send_json(data: dict[str, Any]) -> None:
+        sent.append(data)
+
+    await handler._run_response(session, send_json)
+
+    audio_deltas = [event for event in sent if event.get("type") == "response.output_audio.delta"]
+    done = next(event for event in sent if event.get("type") == "response.done")
+    assert all("vllm_omni" not in event for event in audio_deltas)
+    assert done["vllm_omni"]["stage_metrics"]["0"] == {
+        "num_tokens_out": 3,
+        "vllm_tpot_ms": 11.0,
+        "vllm_itls_ms": [10.0, 12.0],
+    }
+
+
+@pytest.mark.asyncio
 async def test_duplex_chat_rejects_unknown_output_modality():
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(FakeEngineClient()),
@@ -5321,6 +5749,385 @@ async def test_playback_ack_response_id_selects_matching_pending_history_item():
     assert ack["history_committed"] is True
     assert first_item_id in session.pending_history_item_ids
     assert second_item_id not in session.pending_history_item_ids
+
+
+@pytest.mark.asyncio
+async def test_playback_ack_recovers_missing_response_history_registration():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-playback-missing-registration",
+        config=DuplexSessionConfig(playback_commit_policy="ack_only"),
+    )
+    response_id = session.begin_response()
+    session.append_assistant_text("response text")
+    session.mark_audio_sent(1000, text_chars=len("response text"))
+    session.end_response(commit_text=True, preserve_request=True)
+    assert not session.history_item_ids
+    assert f"item_{response_id}" in session.pending_history_item_ids
+
+    ws = TimedWebSocket()
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": f"item_{response_id}",
+            "played_ms": 1000,
+            "committed_ms": 1000,
+        },
+        ws.send_json,
+    )
+
+    ack = next(message for message in ws.sent if message.get("type") == "playback.acknowledged")
+    assert ack["history_committed"] is True
+    assert f"item_{response_id}" in session.history_item_ids
+    assert session.history[-1] == {"role": "assistant", "content": "response text"}
+
+
+@pytest.mark.asyncio
+async def test_playback_ack_rejects_response_after_followup_user_commit():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-playback-after-followup-user",
+        config=DuplexSessionConfig(playback_commit_policy="ack_only"),
+    )
+    session.append_text("user A")
+    session.commit_user_input()
+    response_id = session.begin_response()
+    session.append_assistant_text("assistant A")
+    session.mark_audio_sent(1000, text_chars=len("assistant A"))
+    session.end_response(commit_text=False, preserve_request=True)
+    session.append_text("user B")
+    session.commit_user_input()
+    ws = TimedWebSocket()
+
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": f"item_{response_id}",
+            "played_ms": 1000,
+            "committed_ms": 1000,
+        },
+        ws.send_json,
+    )
+
+    assert ws.sent_types() == ["error"]
+    assert ws.sent[0]["code"] == "playback_ack_too_late"
+    assert session.history == (
+        {"role": "user", "content": "user A"},
+        {"role": "user", "content": "user B"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_precommit_zero_audio_ack_reserves_history_for_response_that_finishes_after_commit():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-zero-audio-checkpoint",
+        config=DuplexSessionConfig(playback_commit_policy="ack_only"),
+    )
+    session.mark_user_input_activity()
+    response_id = session.begin_response()
+    item_id = f"item_{response_id}"
+    ws = TimedWebSocket()
+
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": item_id,
+            "played_ms": 0,
+            "committed_ms": 0,
+        },
+        ws.send_json,
+    )
+    session.commit_native_audio_input(transcript="later user input")
+    session.append_assistant_text("hello world")
+    session.mark_audio_sent(1000, text_chars=len("hello world"))
+    committed_message = session.end_response(commit_text=True, preserve_request=True)
+    session.register_history_item(item_id, committed_message)
+
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": item_id,
+            "played_ms": 1000,
+            "committed_ms": 1000,
+        },
+        ws.send_json,
+    )
+
+    assert not any(message.get("type") == "error" for message in ws.sent)
+    assert session.history == (
+        {"role": "assistant", "content": "hello world"},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": "native-duplex:input-audio"},
+                    "transcript": "later user input",
+                }
+            ],
+            "transcript": "later user input",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_precommit_partial_ack_extends_history_after_response_finishes():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-partial-checkpoint",
+        config=DuplexSessionConfig(playback_commit_policy="ack_only"),
+    )
+    session.mark_user_input_activity()
+    response_id = session.begin_response()
+    item_id = f"item_{response_id}"
+    session.append_assistant_text("hello world")
+    session.mark_audio_sent(1000, text_chars=len("hello world"))
+    ws = TimedWebSocket()
+
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": item_id,
+            "played_ms": 500,
+            "committed_ms": 500,
+        },
+        ws.send_json,
+    )
+    session.commit_native_audio_input(transcript="later user input")
+    committed_message = session.end_response(commit_text=True, preserve_request=True)
+    session.register_history_item(item_id, committed_message)
+
+    assert session.history[0] == {"role": "assistant", "content": "hello"}
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": item_id,
+            "played_ms": 1000,
+            "committed_ms": 1000,
+        },
+        ws.send_json,
+    )
+
+    assert not any(message.get("type") == "error" for message in ws.sent)
+    assert session.history[0] == {"role": "assistant", "content": "hello world"}
+    assert session.history[1]["role"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_explicit_truncate_seals_snapshot_against_later_playback_ack():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-hard-playback-truncate",
+        config=DuplexSessionConfig(playback_commit_policy="ack_only"),
+    )
+    response_id = session.begin_response()
+    item_id = f"item_{response_id}"
+    session.append_assistant_text("hello world")
+    session.mark_audio_sent(1000, text_chars=len("hello world"))
+    session.end_response(commit_text=False, preserve_request=True)
+    ws = TimedWebSocket()
+
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": item_id,
+            "played_ms": 500,
+            "committed_ms": 500,
+            "truncate": True,
+        },
+        ws.send_json,
+    )
+    assert session.history == ({"role": "assistant", "content": "hello"},)
+
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": item_id,
+            "played_ms": 1000,
+            "committed_ms": 1000,
+        },
+        ws.send_json,
+    )
+
+    assert not any(message.get("type") == "error" for message in ws.sent)
+    assert session.history == ({"role": "assistant", "content": "hello"},)
+
+
+@pytest.mark.asyncio
+async def test_cancel_does_not_append_old_assistant_after_followup_user():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-cancel-after-followup-user",
+        config=DuplexSessionConfig(playback_commit_policy="ack_only"),
+    )
+    session.append_text("user A")
+    session.commit_user_input()
+    session.begin_response()
+    session.append_assistant_text("assistant A")
+    session.mark_audio_sent(1000, text_chars=len("assistant A"))
+    session.acknowledge_playback(500, 500)
+    session.append_text("user B")
+    session.commit_user_input()
+    ws = TimedWebSocket()
+
+    cancelled = await handler._cancel_active_response(session, None, ws.send_json, reason="new_response")
+
+    assert cancelled is True
+    assert session.history == (
+        {"role": "user", "content": "user A"},
+        {"role": "user", "content": "user B"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_playback_ack_rejects_item_from_another_response():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(session_id="sid-playback-mismatch", config=DuplexSessionConfig())
+    first_response_id = session.begin_response()
+    session.append_assistant_text("first response")
+    session.mark_audio_sent(1000)
+    session.end_response(commit_text=False, preserve_request=True)
+    session.register_history_item(f"item_{first_response_id}", None)
+    second_response_id = session.begin_response()
+    session.mark_audio_sent(1000)
+    ws = TimedWebSocket()
+
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": second_response_id,
+            "item_id": f"item_{first_response_id}",
+            "played_ms": 500,
+            "committed_ms": 500,
+        },
+        ws.send_json,
+    )
+
+    assert ws.sent_types() == ["error"]
+    assert ws.sent[0]["code"] == "playback_item_mismatch"
+    assert session.active_response_id == second_response_id
+    assert session.playback.as_dict() == {
+        "generated_ms": 1000,
+        "sent_ms": 1000,
+        "played_ms": 0,
+        "committed_ms": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_playback_ack_rejects_user_history_item():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(session_id="sid-playback-user-item", config=DuplexSessionConfig())
+    user_message = {"role": "user", "content": "user input"}
+    session.append_history_message(user_message)
+    session.register_history_item("item_user", user_message)
+    ws = TimedWebSocket()
+
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": "user",
+            "item_id": "item_user",
+            "played_ms": 500,
+            "committed_ms": 500,
+        },
+        ws.send_json,
+    )
+
+    assert ws.sent_types() == ["error"]
+    assert ws.sent[0]["code"] == "playback_item_not_found"
+    assert session.history == ({"role": "user", "content": "user input"},)
+
+
+@pytest.mark.asyncio
+async def test_late_playback_ack_recovers_response_local_history_after_next_response_begins():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(session_id="sid-playback-response-local", config=DuplexSessionConfig())
+    first_response_id = session.begin_response()
+    session.append_assistant_text("first response")
+    session.mark_audio_sent(1000, text_chars=len("first response"))
+    session.end_response(commit_text=False, preserve_request=True)
+    second_response_id = session.begin_response()
+    session.mark_audio_sent(2000, text_chars=len("second response"))
+    ws = TimedWebSocket()
+
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": first_response_id,
+            "item_id": f"item_{first_response_id}",
+            "played_ms": 1000,
+            "committed_ms": 1000,
+        },
+        ws.send_json,
+    )
+
+    ack = next(message for message in ws.sent if message.get("type") == "playback.acknowledged")
+    assert ack["history_committed"] is True
+    assert session.history[-1] == {"role": "assistant", "content": "first response"}
+    assert session.active_response_id == second_response_id
+    assert session.playback.as_dict() == {
+        "generated_ms": 2000,
+        "sent_ms": 2000,
+        "played_ms": 0,
+        "committed_ms": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -6506,7 +7313,7 @@ async def test_audio_clear_preserves_later_wire_order_append():
 
 
 @pytest.mark.asyncio
-async def test_native_append_is_cancelled_by_later_wire_order_input_cancel():
+async def test_native_append_is_cancelled_by_later_wire_order_input_cancel(mocker):
     class SlowAppendEngine(FakeEngineClient):
         def __init__(self) -> None:
             super().__init__()
@@ -6543,6 +7350,7 @@ async def test_native_append_is_cancelled_by_later_wire_order_input_cancel():
                 fence=fence,
             )
 
+    rollback = mocker.spy(MiniCPMO45PcmAppendBuffer, "_rollback_reservation")
     engine = SlowAppendEngine()
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(engine),
@@ -6573,6 +7381,7 @@ async def test_native_append_is_cancelled_by_later_wire_order_input_cancel():
     await asyncio.wait_for(handler_task, timeout=1)
 
     assert engine.append_cancelled.is_set()
+    rollback.assert_called_once()
     assert engine.signal_fences[-1] == DuplexFence("sid-cancel-slow-append")
     assert engine.signal_next_fences[-1] == DuplexFence("sid-cancel-slow-append", epoch=1)
 
@@ -6672,29 +7481,65 @@ async def test_native_session_update_commits_config_only_after_runtime_ack():
         chat_service=FakeChatService(engine),
         config_timeout_s=0.1,
         idle_timeout_s=1,
+        server_vad_backend_provider=FakeServerVADProvider(FakeServerVADBackend([])),
     )
     ws = TimedWebSocket()
-    ws.put(_session_create("sid-update-two-phase"))
-    ws.put(
-        {
-            "type": "turn.signal",
-            "event": "session.update",
-            "payload": {"instructions": "candidate instructions"},
-        }
-    )
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    ws.put(_native_realtime_session_update("sid-update-two-phase"))
+    ws.put(_native_server_vad_update("update-two-phase"))
 
-    handler_task = asyncio.create_task(handler.handle_session(ws))
-    await asyncio.wait_for(engine.update_started.wait(), timeout=1)
+    handler_task = asyncio.create_task(handler.handle_session(ws, realtime_protocol=protocol))
+    await asyncio.wait_for(engine.update_started.wait(), timeout=10)
     live_session = handler._registry.get("sid-update-two-phase")
     assert live_session is not None
-    assert live_session.config.instructions != "candidate instructions"
+    assert live_session.config.overlap_policy == DuplexOverlapPolicy.LISTEN_ONLY.value
+    assert protocol._pending_turn_detection_update is not None
+    assert protocol._turn_detection is None
+
+    protocol.encode_outbound_event({"type": "error", "code": "unrelated", "error": "unrelated"})
+    assert protocol._pending_turn_detection_update is not None
 
     engine.release_update.set()
     ws.put({"type": "session.close"})
     await asyncio.wait_for(handler_task, timeout=2)
 
-    updated = next(message for message in ws.sent if message.get("type") == "session.updated")
-    assert updated["session"]["instructions"] == "candidate instructions"
+    updated = next(message for message in reversed(ws.sent) if message.get("type") == "session.updated")
+    assert updated["session"]["overlap_policy"] == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+    assert protocol._turn_detection is not None
+
+
+@pytest.mark.parametrize(
+    ("append_fails", "expected_code"),
+    [(True, "session_update_aborted"), (False, "instructions_update_unsupported")],
+)
+@pytest.mark.asyncio
+async def test_native_server_vad_update_rejection_does_not_stall(append_fails, expected_code):
+    append_result = {"operation": "append", "ok": False, "error_count": 1} if append_fails else None
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient(append_result=append_result)),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+        server_vad_backend_provider=FakeServerVADProvider(FakeServerVADBackend([])),
+    )
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    create = _native_realtime_session_update("sid-rejected-vad-update")
+    create["session"]["extra_body"]["auto_response"] = append_fails
+    ws.put(create)
+    if append_fails:
+        ws.put({"type": "input_audio_buffer.append", "audio": _pcm_f32_b64(16_000), "format": "pcm_f32le"})
+    update = _native_server_vad_update("rejected-vad-update")
+    if not append_fails:
+        update["session"]["instructions"] = "You are now a pirate."
+    ws.put(update)
+    ws.put({"type": "session.close"})
+
+    await asyncio.wait_for(handler.handle_session(ws, realtime_protocol=protocol), timeout=2)
+
+    errors = [message["error"] for message in ws.sent if isinstance(message.get("error"), dict)]
+    error = next(error for error in errors if error.get("code") == expected_code)
+    assert error["event_id"] == "rejected-vad-update"
+    assert protocol._pending_turn_detection_update is None
 
 
 @pytest.mark.asyncio
@@ -7194,7 +8039,7 @@ async def test_minicpmo_native_duplex_rejects_ref_audio_path():
     assert engine.opened == []
 
 
-def test_minicpmo_native_duplex_explicit_barge_in_request_is_deferred_as_listen():
+def test_minicpmo_native_duplex_explicit_barge_in_request_interrupts():
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(engine),
@@ -7221,13 +8066,133 @@ def test_minicpmo_native_duplex_explicit_barge_in_request_is_deferred_as_listen(
     )
 
     assert decision == {
-        "action": "listen",
-        "reason": "barge_in_unsupported",
+        "action": "barge_in",
+        "reason": "client_force_barge_in",
         "duration_ms": 1000,
-        "overlap_speech_ms": 1000,
         "buffer_audio": True,
-        "defer_runtime_append": True,
     }
+
+
+def test_native_server_vad_speech_started_triggers_barge_in_once():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-native-server-vad-barge-in",
+        config=DuplexSessionConfig(overlap_policy=DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value),
+        capabilities=DuplexCapabilities.minicpmo45_native(),
+    )
+    payload = _native_audio_payload(samples=512, is_speech=True)
+
+    started = handler._overlap_decision(
+        session,
+        {"vad": {"speech_started": True}},
+        payload,
+    )
+    active = handler._overlap_decision(
+        session,
+        {"vad": {"speech_started": False}},
+        payload,
+    )
+
+    assert started["action"] == "barge_in"
+    assert started["reason"] == "server_vad_speech_started"
+    assert started["cancel_reason"] == "turn_detected"
+    assert active["action"] == "listen"
+    assert active["reason"] == "server_vad_utterance_active"
+    assert active["force_listen"] is True
+
+
+@pytest.mark.asyncio
+async def test_native_server_vad_uses_shared_pipeline_and_emits_boundaries():
+    backend = FakeServerVADBackend([0.9] * 10 + [0.0] * 50)
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+        server_vad_backend_provider=FakeServerVADProvider(backend),
+    )
+    ws = TimedWebSocket()
+    create = _native_realtime_session_update("sid-native-shared-server-vad")
+    create["session"]["turn_detection"] = {"type": "server_vad"}
+    ws.put(create)
+    ws.put(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(60 * backend.frame_samples, value=0.0),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16_000,
+        }
+    )
+    ws.put({"type": "session.close"})
+
+    await asyncio.wait_for(
+        handler.handle_session(ws, realtime_protocol=NativeRealtimeSessionProtocol({})),
+        timeout=10,
+    )
+
+    boundary_events = [
+        event
+        for event in ws.sent
+        if event.get("type") in {"input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped"}
+    ]
+    assert [event["type"] for event in boundary_events] == [
+        "input_audio_buffer.speech_started",
+        "input_audio_buffer.speech_stopped",
+    ]
+    assert boundary_events[0]["item_id"] == boundary_events[1]["item_id"]
+    assert backend.calls == 60
+
+
+@pytest.mark.asyncio
+async def test_native_server_vad_boundary_allows_explicit_commit():
+    protocol = NativeRealtimeSessionProtocol({})
+    protocol._turn_detection = {
+        "type": "server_vad",
+        "interrupt_response": True,
+    }
+    item_id = "item_native_server_vad"
+
+    protocol.encode_outbound_event(
+        {
+            "type": "input_audio_buffer.speech_started",
+            "item_id": item_id,
+            "audio_start_ms": 0,
+        }
+    )
+    protocol.encode_outbound_event(
+        {
+            "type": "input_audio_buffer.speech_stopped",
+            "item_id": item_id,
+            "audio_end_ms": 500,
+        }
+    )
+
+    committed = await protocol._to_duplex_event(
+        {
+            "type": "input_audio_buffer.commit",
+            "final": True,
+        }
+    )
+
+    assert committed is not None
+    assert committed["item_id"] == item_id
+
+
+def test_serving_vad_classification_overrides_client_speech_hint():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        "sid-server-vad-classification",
+        DuplexSessionConfig(),
+        capabilities=DuplexCapabilities.minicpmo45_native(),
+    )
+
+    assert (
+        handler._input_looks_like_speech(
+            {"is_speech": False},
+            {"is_speech": True},
+            session=session,
+        )
+        is True
+    )
 
 
 @pytest.mark.asyncio
@@ -7238,7 +8203,7 @@ def test_minicpmo_native_duplex_explicit_barge_in_request_is_deferred_as_listen(
         {"type": "turn.signal", "event": "barge_in"},
     ],
 )
-async def test_minicpmo_native_duplex_rejects_unadvertised_barge_in_control(
+async def test_minicpmo_native_duplex_accepts_explicit_barge_in_control(
     barge_in_event: dict[str, object],
 ):
     engine = FakeEngineClient()
@@ -7254,9 +8219,8 @@ async def test_minicpmo_native_duplex_rejects_unadvertised_barge_in_control(
 
     await handler.handle_session(ws)
 
-    error = next(message for message in ws.sent if message.get("code") == "barge_in_unsupported")
-    assert error["session_id"] == "sid-native-barge-control-disabled"
-    assert ("sid-native-barge-control-disabled", "barge_in") not in engine.signals
+    assert not any(message.get("code") == "barge_in_unsupported" for message in ws.sent)
+    assert ("sid-native-barge-control-disabled", "barge_in") in engine.signals
 
 
 @pytest.mark.asyncio
