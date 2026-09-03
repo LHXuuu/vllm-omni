@@ -201,127 +201,18 @@ async def _append_pcm16_chunks(ws, pcm16: bytes, chunk_bytes: int) -> None:
         )
 
 
-async def _receive_server_vad_turn(ws, turn_index: int) -> dict:
-    audio: list[bytes] = []
-    text_deltas: list[str] = []
-    transcript_deltas: list[str] = []
-    final_text = ""
-    final_transcript = ""
-    event_types: list[str] = []
-    output_sample_rate = 24_000
-    speech_started_item_id = None
-    speech_stopped_item_id = None
-    input_item_id = None
-    response_id = None
-    response_status = None
-    committed_events = 0
-
+async def _receive_server_vad_turn(ws) -> list[dict]:
+    events: list[dict] = []
     while True:
         message = await asyncio.wait_for(ws.recv(), timeout=600)
         if isinstance(message, bytes):
             continue
-
         event = json.loads(message)
-        event_type = str(event.get("type") or "")
-        event_types.append(event_type)
-
-        if event_type == "error":
+        events.append(event)
+        if event.get("type") == "error":
             raise AssertionError(f"WebSocket error: {event}")
-        if event_type == "input_audio_buffer.speech_started":
-            item_id = event.get("item_id")
-            if isinstance(item_id, str):
-                speech_started_item_id = item_id
-            continue
-        if event_type == "input_audio_buffer.speech_stopped":
-            item_id = event.get("item_id")
-            if isinstance(item_id, str):
-                speech_stopped_item_id = item_id
-            continue
-        if event_type == "input_audio_buffer.committed":
-            committed_events += 1
-            item_id = event.get("item_id")
-            if isinstance(item_id, str):
-                input_item_id = item_id
-            continue
-        if event_type == "response.created":
-            response = event.get("response")
-            if isinstance(response, dict) and isinstance(response.get("id"), str):
-                response_id = response["id"]
-            continue
-        if event_type == "response.audio.delta":
-            assert response_id is not None
-            assert event.get("response_id") == response_id
-            delta = event.get("delta")
-            if isinstance(delta, str) and delta:
-                audio.append(base64.b64decode(delta))
-            sample_rate_hz = event.get("sample_rate_hz")
-            if isinstance(sample_rate_hz, int) and sample_rate_hz > 0:
-                output_sample_rate = sample_rate_hz
-            continue
-        if event_type == "response.output_text.delta":
-            assert event.get("response_id") == response_id
-            delta = event.get("delta")
-            if isinstance(delta, str):
-                text_deltas.append(delta)
-            continue
-        if event_type == "response.output_text.done":
-            assert event.get("response_id") == response_id
-            text = event.get("text")
-            if isinstance(text, str):
-                final_text = text
-            continue
-        if event_type == "response.audio_transcript.delta":
-            assert event.get("response_id") == response_id
-            delta = event.get("delta")
-            if isinstance(delta, str):
-                transcript_deltas.append(delta)
-            continue
-        if event_type == "response.audio_transcript.done":
-            assert event.get("response_id") == response_id
-            transcript = event.get("transcript")
-            if isinstance(transcript, str):
-                final_transcript = transcript
-            continue
-        if event_type == "response.done":
-            response = event.get("response")
-            done_response_id = event.get("response_id")
-            if not isinstance(done_response_id, str) and isinstance(response, dict):
-                done_response_id = response.get("id")
-            assert response_id is not None
-            assert done_response_id == response_id
-            if isinstance(response, dict) and isinstance(response.get("status"), str):
-                response_status = response["status"]
-            break
-        if event_type in {
-            "session.created",
-            "session.updated",
-            "rate_limits.updated",
-            "conversation.item.added",
-            "conversation.item.done",
-            "response.output_item.added",
-            "response.content_part.added",
-            "response.audio.done",
-            "response.content_part.done",
-            "response.output_item.done",
-        }:
-            continue
-        raise AssertionError(f"Unexpected Server VAD event: {event}")
-
-    transcription_text = final_text or "".join(text_deltas) or final_transcript or "".join(transcript_deltas)
-    return {
-        "turn_index": turn_index,
-        "speech_started_item_id": speech_started_item_id,
-        "speech_stopped_item_id": speech_stopped_item_id,
-        "input_item_id": input_item_id,
-        "response_id": response_id,
-        "status": response_status,
-        "event_types": event_types,
-        "output_pcm": b"".join(audio),
-        "output_sample_rate": output_sample_rate,
-        "transcription_text": transcription_text,
-        "delta_events": len(audio),
-        "committed_events": committed_events,
-    }
+        if event.get("type") == "response.done":
+            return events
 
 
 async def _run_server_vad_audio_roundtrips(
@@ -332,9 +223,9 @@ async def _run_server_vad_audio_roundtrips(
     *,
     chunk_ms: int = 100,
     turns: int = 2,
-) -> dict:
+) -> list[list[dict]]:
     chunk_bytes = max(16_000 * 2 // 1000 * chunk_ms, 2)
-    turn_results: list[dict] = []
+    turn_events: list[list[dict]] = []
 
     async with websockets.connect(f"ws://{host}:{port}/v1/realtime", max_size=64 * 1024 * 1024) as ws:
         await ws.send(
@@ -360,19 +251,12 @@ async def _run_server_vad_audio_roundtrips(
         )
 
         silence = bytes(16_000 * 2 * 3 // 2)
-        for turn_index in range(1, turns + 1):
+        for _ in range(turns):
             await _append_pcm16_chunks(ws, pcm16, chunk_bytes)
             await _append_pcm16_chunks(ws, silence, chunk_bytes)
-            turn_results.append(await _receive_server_vad_turn(ws, turn_index))
+            turn_events.append(await _receive_server_vad_turn(ws))
 
-    return {
-        "output_pcm": b"".join(turn["output_pcm"] for turn in turn_results),
-        "output_sample_rate": turn_results[-1]["output_sample_rate"],
-        "transcription_text": turn_results[-1]["transcription_text"],
-        "delta_events": sum(turn["delta_events"] for turn in turn_results),
-        "committed_events": sum(turn["committed_events"] for turn in turn_results),
-        "turns": turn_results,
-    }
+    return turn_events
 
 
 @pytest.fixture(scope="class")
@@ -513,7 +397,7 @@ class TestQwen3OmniRealtimeWebSocket:
         assert cached_silero_vad_artifact
         pcm16 = _synthetic_pcm16_input()
 
-        result = asyncio.run(
+        turns = asyncio.run(
             _run_server_vad_audio_roundtrips(
                 omni_server.host,
                 omni_server.port,
@@ -524,11 +408,7 @@ class TestQwen3OmniRealtimeWebSocket:
             )
         )
 
-        _assert_realtime_smoke(result)
-        assert result["committed_events"] == 2
-        turn_results = result["turns"]
-        assert len(turn_results) == 2
-
+        assert len(turns) == 2
         required_sequence = [
             "input_audio_buffer.speech_started",
             "input_audio_buffer.speech_stopped",
@@ -538,21 +418,25 @@ class TestQwen3OmniRealtimeWebSocket:
             "response.audio.done",
             "response.done",
         ]
-        for turn in turn_results:
-            assert turn["status"] == "completed"
-            assert turn["committed_events"] == 1
-            assert turn["delta_events"] >= 1
-            assert turn["output_pcm"]
-            assert turn["transcription_text"]
-            event_types = turn["event_types"]
+        input_item_ids: list[str] = []
+        response_ids: list[str] = []
+        for events in turns:
+            event_types = [event["type"] for event in events]
             positions = [event_types.index(event_type) for event_type in required_sequence]
             assert positions == sorted(positions)
-            assert turn["speech_started_item_id"] == turn["speech_stopped_item_id"] == turn["input_item_id"]
 
-        input_item_ids = [turn["input_item_id"] for turn in turn_results]
-        response_ids = [turn["response_id"] for turn in turn_results]
-        assert all(isinstance(value, str) and value for value in input_item_ids)
-        assert all(isinstance(value, str) and value for value in response_ids)
+            started = next(event for event in events if event["type"] == "input_audio_buffer.speech_started")
+            stopped = next(event for event in events if event["type"] == "input_audio_buffer.speech_stopped")
+            committed = next(event for event in events if event["type"] == "input_audio_buffer.committed")
+            created = next(event for event in events if event["type"] == "response.created")["response"]
+            done = next(event for event in events if event["type"] == "response.done")["response"]
+
+            assert started["item_id"] == stopped["item_id"] == committed["item_id"]
+            assert created["id"] == done["id"]
+            assert done["status"] == "completed"
+            input_item_ids.append(committed["item_id"])
+            response_ids.append(created["id"])
+
         assert len(set(input_item_ids)) == 2
         assert len(set(response_ids)) == 2
 

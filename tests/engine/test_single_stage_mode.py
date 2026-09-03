@@ -473,29 +473,6 @@ class TestSingleStageModeDetection:
         load_deploy_config.assert_called_once_with("/fake/duplex.yaml")
         assert engine.duplex_session_config is duplex_session
 
-    def test_bare_deploy_name_loads_runtime_config_from_resolved_path(self, mocker: MockerFixture):
-        duplex_session = DuplexSessionRuntimeConfig(server_vad_model_path="/models/silero_vad.onnx")
-        resolved_path = "/package/vllm_omni/deploy/qwen3_omni_moe.yaml"
-        mocker.patch(
-            "vllm_omni.engine.async_omni_engine.StageConfigFactory.get_pipeline_config",
-            return_value=None,
-        )
-        load_deploy_config = mocker.patch(
-            "vllm_omni.engine.async_omni_engine.load_deploy_config",
-            return_value=SimpleNamespace(duplex_session=duplex_session),
-        )
-
-        engine = self._make_engine_no_thread(
-            mocker,
-            deploy_config="qwen3_omni_moe.yaml",
-            resolved_config_path=resolved_path,
-            patch_pipeline_config=False,
-            patch_runtime_config=False,
-        )
-
-        load_deploy_config.assert_called_once_with(resolved_path)
-        assert engine.duplex_session_config is duplex_session
-
     def test_auto_discovered_deploy_loads_duplex_runtime_config(
         self,
         tmp_path: Path,

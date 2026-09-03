@@ -105,16 +105,14 @@ async def run_client(
     output_sample_rate = 24000
     delta_index = 0
     text_chunks: list[str] = []
-    audio_transcript_chunks: list[str] = []
     final_text: str = ""
     final_audio_transcript: str = ""
 
     if delta_dump_dir is not None:
         delta_dump_dir.mkdir(parents=True, exist_ok=True)
 
-    # Bare /v1/realtime selects the duplex stack for duplex deployments.
-    # Keep this example's legacy manual-commit wire behavior available through
-    # the explicit opt-out while Server VAD uses the new stack.
+    # Keep the CLI mode authoritative even if the input URL already contains
+    # an explicit duplex query parameter.
     url = _with_duplex_route(url, enabled=server_vad)
     async with websockets.connect(url, max_size=64 * 1024 * 1024) as ws:
         # 1) Validate model.
@@ -189,21 +187,6 @@ async def run_client(
             if event_type == "session.created":
                 continue
 
-            if event_type in {
-                "session.updated",
-                "input_audio_buffer.speech_started",
-                "input_audio_buffer.speech_stopped",
-                "input_audio_buffer.committed",
-                "conversation.item.added",
-                "conversation.item.done",
-                "response.created",
-                "response.output_item.added",
-                "response.content_part.added",
-                "response.content_part.done",
-                "response.output_item.done",
-            }:
-                continue
-
             if event_type == "response.audio.delta":
                 sr = event.get("sample_rate_hz")
                 if isinstance(sr, int) and sr > 0:
@@ -240,14 +223,8 @@ async def run_client(
                     print(f"{log_prefix}text usage: {usage}")
                 continue
 
-            if event_type == "response.audio_transcript.delta":
-                delta = event.get("delta", "")
-                if delta:
-                    audio_transcript_chunks.append(delta)
-                continue
-
             if event_type == "response.audio_transcript.done":
-                final_audio_transcript = event.get("transcript", "") or "".join(audio_transcript_chunks)
+                final_audio_transcript = event.get("transcript", "")
                 continue
 
             if event_type == "response.audio.done":
@@ -270,9 +247,7 @@ async def run_client(
         print(f"{log_prefix}Saved realtime audio to: {output_wav} (incremental chunks joined)")
 
         if output_text is not None:
-            text_to_save = (
-                final_text or "".join(text_chunks) or final_audio_transcript or "".join(audio_transcript_chunks)
-            )
+            text_to_save = final_text or "".join(text_chunks) or final_audio_transcript
             output_text.parent.mkdir(parents=True, exist_ok=True)
             output_text.write_text(text_to_save, encoding="utf-8")
             print(f"{log_prefix}Saved realtime text to: {output_text}")

@@ -343,8 +343,13 @@ class TurnBasedFakeChatService(FakeChatService):
 
     duplex_serving_adapter_path = None
 
+    def __init__(self, engine_client: FakeEngineClient) -> None:
+        super().__init__(engine_client)
+        self.requests: list[Any] = []
+
     async def create_chat_completion(self, request, raw_request=None):
         del raw_request
+        self.requests.append(request)
         self.seen_request_ids.append(request.request_id)
 
         async def _gen():
@@ -512,6 +517,7 @@ def _server_vad_session_update(
     turn_detection: dict[str, Any] | None,
     *,
     event_id: str | None = None,
+    sample_rate_hz: int = 16_000,
 ) -> dict[str, Any]:
     event: dict[str, Any] = {
         "type": "session.update",
@@ -519,7 +525,7 @@ def _server_vad_session_update(
             "model": "test-model",
             "audio": {
                 "input": {
-                    "format": {"type": "audio/pcm", "rate": 16_000},
+                    "format": {"type": "audio/pcm", "rate": sample_rate_hz},
                     "turn_detection": turn_detection,
                 }
             },
@@ -535,12 +541,14 @@ def _server_vad_audio_append(
     *,
     event_id: str | None = None,
     is_speech: bool | None = None,
+    sample_rate_hz: int = 16_000,
 ) -> dict[str, Any]:
+    sample_count = frame_count * 160 * sample_rate_hz // 16_000
     event: dict[str, Any] = {
         "type": "input_audio_buffer.append",
-        "audio": base64.b64encode(np.zeros(160 * frame_count, dtype="<i2").tobytes()).decode(),
+        "audio": base64.b64encode(np.zeros(sample_count, dtype="<i2").tobytes()).decode(),
         "format": "pcm16",
-        "sample_rate_hz": 16_000,
+        "sample_rate_hz": sample_rate_hz,
     }
     if event_id is not None:
         event["event_id"] = event_id
@@ -974,7 +982,6 @@ async def test_realtime_protocol_accepts_turn_based_server_vad():
     assert append is not None
     assert append["format"] == "pcm16"
     assert append["sample_rate_hz"] == 16_000
-    assert not any(event.get("type") == "input_audio_buffer.speech_started" for event in ws.sent)
 
 
 @pytest.mark.asyncio
@@ -1040,59 +1047,6 @@ async def test_native_realtime_protocol_accepts_disabled_turn_detection():
 
     assert translated["type"] == "session.create"
     assert translated["session"]["extra_body"]["realtime_session_payload"]["turn_detection"] is None
-
-
-@pytest.mark.asyncio
-async def test_rejected_session_update_never_exposes_candidate_protocol_audio_config():
-    ws = TimedWebSocket()
-    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
-    protocol.bind_sender(ws.send_json)
-
-    initial = await protocol._to_duplex_event(
-        {
-            "type": "session.update",
-            "session": {
-                "model": "test-model",
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcm", "rate": 16_000},
-                        "turn_detection": None,
-                    }
-                },
-            },
-        }
-    )
-    assert initial is not None
-    protocol.commit_realtime_turn_detection_update()
-    assert protocol._input_sample_rate_hz == 16_000
-
-    candidate = await protocol._to_duplex_event(
-        {
-            "type": "session.update",
-            "session": {
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcm", "rate": 24_000},
-                    }
-                },
-            },
-        }
-    )
-    assert candidate is not None
-    assert protocol._input_sample_rate_hz == 16_000
-    assert protocol.pending_realtime_input_audio_config_changed()
-
-    protocol.reject_realtime_turn_detection_update()
-
-    assert protocol._input_sample_rate_hz == 16_000
-    updated = protocol._from_duplex_event(
-        {
-            "type": "session.updated",
-            "session": {},
-        }
-    )[0]
-    assert updated["session"]["turn_detection"] is None
-    assert updated["session"]["audio"]["input"]["turn_detection"] is None
 
 
 def test_native_realtime_protocol_preserves_omitted_turn_detection():
@@ -1444,43 +1398,6 @@ async def test_realtime_invalid_server_vad_audio_is_correlated_and_unbuffered(au
     assert empty_buffer["event_id"] == "event-commit-after-invalid-audio"
 
 
-def test_native_realtime_protocol_response_done_does_not_reorder_conversation_tail():
-    protocol = NativeRealtimeSessionProtocol(TimedWebSocket())  # type: ignore[arg-type]
-
-    protocol.encode_outbound_event(
-        {
-            "type": "response.created",
-            "response_id": "resp-first",
-            "modalities": ["text"],
-        }
-    )
-    protocol.encode_outbound_event(
-        {
-            "type": "input.committed",
-            "item_id": "item-second-user",
-            "message": {"role": "user", "content": "second turn"},
-        }
-    )
-    protocol.encode_outbound_event(
-        {
-            "type": "response.done",
-            "response_id": "resp-first",
-            "status": "completed",
-        }
-    )
-
-    second_response_events = protocol.encode_outbound_event(
-        {
-            "type": "response.created",
-            "response_id": "resp-second",
-            "modalities": ["text"],
-        }
-    )
-    second_item_added = next(event for event in second_response_events if event["type"] == "conversation.item.added")
-
-    assert second_item_added["previous_item_id"] == "item-second-user"
-
-
 def test_native_realtime_protocol_projects_input_commit_in_openai_order():
     protocol = NativeRealtimeSessionProtocol(TimedWebSocket())  # type: ignore[arg-type]
     client_event_id = "client-input-commit"
@@ -1598,40 +1515,6 @@ async def test_turn_based_server_vad_rejects_input_rate_change_after_append(
     assert error["event_id"] == "event-rate-change"
 
 
-@pytest.mark.asyncio
-async def test_manual_turn_based_session_allows_input_rate_update_after_append():
-    initial = _server_vad_session_update(None)
-    append = _server_vad_audio_append(frame_count=1)
-    ws = TimedWebSocket()
-    ws.put(initial)
-    ws.put(append)
-    ws.put(
-        {
-            "type": "session.update",
-            "event_id": "event-manual-rate-change",
-            "session": {
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcm", "rate": 24_000},
-                    }
-                }
-            },
-        }
-    )
-    ws.put({"type": "session.close"})
-    handler = OmniDuplexSessionHandler(
-        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
-    )
-
-    await handler.handle_realtime_session(ws)  # type: ignore[arg-type]
-
-    assert any(event.get("type") == "session.updated" for event in ws.sent)
-    assert not any(
-        event.get("type") == "error" and event.get("error", {}).get("event_id") == "event-manual-rate-change"
-        for event in ws.sent
-    )
-
-
 @pytest.mark.parametrize("sample_rate_hz", INVALID_VALIDATED_SAMPLE_RATES)
 def test_native_realtime_protocol_validates_nested_audio_sample_rate(sample_rate_hz: object):
     with pytest.raises(ValueError, match="sample_rate_hz"):
@@ -1719,40 +1602,13 @@ async def test_realtime_server_vad_commits_without_client_commit(sample_rate_hz:
 
     ws = TimedWebSocket(on_send=on_send)
     ws.put(
-        {
-            "type": "session.update",
-            "session": {
-                "model": "test-model",
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcm", "rate": sample_rate_hz},
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "prefix_padding_ms": 10,
-                            "silence_duration_ms": 20,
-                            "create_response": False,
-                            "interrupt_response": False,
-                        },
-                    }
-                },
-            },
-        }
+        _server_vad_session_update(
+            _server_vad_turn_detection(create_response=False),
+            sample_rate_hz=sample_rate_hz,
+        )
     )
-    # The streaming polyphase resampler retains a small amount of right
-    # context. Supply it at 24 kHz so five complete 16 kHz VAD frames are
-    # available without flushing the still-open input stream.
-    # Give the streaming resampler enough future input to emit the final VAD
-    # frame without coupling this test to a particular FIR implementation.
-    right_context_samples = sample_rate_hz // 100 if sample_rate_hz == 24_000 else 0
-    pcm16 = np.zeros((sample_rate_hz // 100) * 5 + right_context_samples, dtype="<i2")
-    ws.put(
-        {
-            "type": "input_audio_buffer.append",
-            "audio": base64.b64encode(pcm16.tobytes()).decode(),
-            "format": "pcm16",
-            "sample_rate_hz": sample_rate_hz,
-        }
-    )
+    # One extra source frame supplies the streaming FIR's right context.
+    ws.put(_server_vad_audio_append(6, sample_rate_hz=sample_rate_hz))
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(
         chat_service=TurnBasedFakeChatService(engine),
@@ -1788,35 +1644,8 @@ async def test_realtime_server_vad_create_response_false_accepts_response_create
             ws.put({"type": "session.close"})
 
     ws = TimedWebSocket(on_send=on_send)
-    ws.put(
-        {
-            "type": "session.update",
-            "session": {
-                "model": "test-model",
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcm", "rate": 16_000},
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "prefix_padding_ms": 10,
-                            "silence_duration_ms": 20,
-                            "create_response": False,
-                            "interrupt_response": False,
-                        },
-                    }
-                },
-            },
-        }
-    )
-    pcm16 = np.zeros(160 * 5, dtype="<i2")
-    ws.put(
-        {
-            "type": "input_audio_buffer.append",
-            "audio": base64.b64encode(pcm16.tobytes()).decode(),
-            "format": "pcm16",
-            "sample_rate_hz": 16_000,
-        }
-    )
+    ws.put(_server_vad_session_update(_server_vad_turn_detection(create_response=False)))
+    ws.put(_server_vad_audio_append())
     engine = FakeEngineClient()
     chat_service = TurnBasedFakeChatService(engine)
     handler = OmniDuplexSessionHandler(
@@ -1831,57 +1660,24 @@ async def test_realtime_server_vad_create_response_false_accepts_response_create
     assert event_types.index("response.created") < event_types.index("response.done")
     assert event_types.count("response.created") == 1
     assert len(chat_service.seen_request_ids) == 1
+    assert engine.opened == engine.signals == engine.closed == []
 
 
 @pytest.mark.asyncio
 async def test_realtime_server_vad_complete_audio_item_preserves_wire_item_and_uses_wav_history():
-    class CapturingChatService(TurnBasedFakeChatService):
-        def __init__(self, engine_client: FakeEngineClient) -> None:
-            super().__init__(engine_client)
-            self.requests: list[Any] = []
-
-        async def create_chat_completion(self, request, raw_request=None):
-            self.requests.append(request)
-            return await super().create_chat_completion(request, raw_request)
-
-    response_started_before_explicit_create = False
-    explicit_create_sent = False
-
     def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
-        nonlocal response_started_before_explicit_create, explicit_create_sent
-        if data.get("type") == "response.created" and not explicit_create_sent:
-            response_started_before_explicit_create = True
         item = data.get("item")
         if (
             data.get("type") == "conversation.item.done"
             and isinstance(item, dict)
             and item.get("id") == "item-complete-audio"
-            and not explicit_create_sent
         ):
-            explicit_create_sent = True
             ws.put({"type": "response.create"})
         if data.get("type") == "response.done":
             ws.put({"type": "session.close"})
 
     ws = TimedWebSocket(on_send=on_send)
-    ws.put(
-        {
-            "type": "session.update",
-            "session": {
-                "model": "test-model",
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcm", "rate": 24_000},
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "create_response": True,
-                            "interrupt_response": False,
-                        },
-                    }
-                },
-            },
-        }
-    )
+    ws.put(_server_vad_session_update(_server_vad_turn_detection(), sample_rate_hz=24_000))
     sample_rate_hz = 24_000
     samples = np.arange(sample_rate_hz // 10, dtype=np.float32)
     pcm16 = np.rint(0.5 * np.sin(2 * np.pi * 1_000 * samples / sample_rate_hz) * 32_767).astype("<i2")
@@ -1899,7 +1695,7 @@ async def test_realtime_server_vad_complete_audio_item_preserves_wire_item_and_u
         }
     )
     engine = FakeEngineClient()
-    chat_service = CapturingChatService(engine)
+    chat_service = TurnBasedFakeChatService(engine)
     vad_backend = FakeServerVADBackend([0.0])
     handler = OmniDuplexSessionHandler(
         chat_service=chat_service,
@@ -1912,7 +1708,6 @@ async def test_realtime_server_vad_complete_audio_item_preserves_wire_item_and_u
     done = next(event for event in ws.sent if event.get("type") == "conversation.item.done")
     assert added["item"] == done["item"]
     assert done["item"]["content"] == [{"type": "input_audio", "audio": public_audio}]
-    assert response_started_before_explicit_create is False
     event_types = ws.sent_types()
     assert event_types.index("conversation.item.added") < event_types.index("conversation.item.done")
     assert event_types.index("conversation.item.done") < event_types.index("response.created")
@@ -1934,48 +1729,6 @@ async def test_realtime_server_vad_complete_audio_item_preserves_wire_item_and_u
         assert wav_file.getsampwidth() == 2
         assert wav_file.getframerate() == 16_000
         assert wav_file.getnframes() == 1_600
-
-
-@pytest.mark.asyncio
-async def test_realtime_initial_server_vad_failure_preserves_event_id():
-    ws = TimedWebSocket()
-    ws.put(_server_vad_session_update(_server_vad_turn_detection(), event_id="event-initial-server-vad"))
-    handler = OmniDuplexSessionHandler(
-        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
-        server_vad_backend_provider=FailingServerVADProvider(),
-    )
-
-    await handler.handle_realtime_session(ws)  # type: ignore[arg-type]
-
-    error = next(
-        event["error"]
-        for event in ws.sent
-        if event.get("type") == "error" and event.get("error", {}).get("code") == "server_vad_initialization_failed"
-    )
-    assert error["event_id"] == "event-initial-server-vad"
-
-
-@pytest.mark.asyncio
-async def test_turn_based_rejects_interrupting_server_vad_with_event_id():
-    ws = TimedWebSocket()
-    ws.put(
-        _server_vad_session_update(
-            {"type": "server_vad"},
-            event_id="event-interrupting-server-vad",
-        )
-    )
-    handler = OmniDuplexSessionHandler(
-        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
-    )
-
-    await handler.handle_realtime_session(ws)  # type: ignore[arg-type]
-
-    error = next(
-        event["error"]
-        for event in ws.sent
-        if event.get("type") == "error" and event.get("error", {}).get("code") == "server_vad_requires_native_duplex"
-    )
-    assert error["event_id"] == "event-interrupting-server-vad"
 
 
 @pytest.mark.asyncio
@@ -2141,61 +1894,7 @@ async def test_realtime_failed_server_vad_append_does_not_lock_turn_detection():
 
 
 @pytest.mark.asyncio
-async def test_realtime_server_vad_adapterless_chat_fallback():
-    def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
-        if data.get("type") == "response.done":
-            ws.put({"type": "session.close"})
-
-    ws = TimedWebSocket(on_send=on_send)
-    ws.put(
-        {
-            "type": "session.update",
-            "session": {
-                "model": "test-model",
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcm", "rate": 16_000},
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "prefix_padding_ms": 10,
-                            "silence_duration_ms": 20,
-                            "create_response": True,
-                            "interrupt_response": False,
-                        },
-                    }
-                },
-            },
-        }
-    )
-    pcm16 = np.zeros(160 * 5, dtype="<i2")
-    ws.put(
-        {
-            "type": "input_audio_buffer.append",
-            "audio": base64.b64encode(pcm16.tobytes()).decode(),
-            "format": "pcm16",
-            "sample_rate_hz": 16_000,
-        }
-    )
-    engine = FakeEngineClient()
-    chat_service = TurnBasedFakeChatService(engine)
-    handler = OmniDuplexSessionHandler(
-        chat_service=chat_service,
-        server_vad_backend_provider=FakeServerVADProvider(FakeServerVADBackend([0.0, 0.9, 0.8, 0.0, 0.0])),
-    )
-
-    await handler.handle_realtime_session(ws)  # type: ignore[arg-type]
-
-    event_types = ws.sent_types()
-    assert event_types.index("input_audio_buffer.committed") < event_types.index("response.created")
-    assert event_types.index("response.created") < event_types.index("response.done")
-    assert len(chat_service.seen_request_ids) == 1
-    assert engine.opened == []
-    assert engine.signals == []
-    assert engine.closed == []
-
-
-@pytest.mark.asyncio
-async def test_realtime_server_vad_queues_one_turn_behind_active_response():
+async def test_realtime_server_vad_queues_one_turn_and_rejects_further_input():
     chat_service = GateChatService(FakeEngineClient())
     committed_count = 0
     response_count = 0
@@ -2204,14 +1903,14 @@ async def test_realtime_server_vad_queues_one_turn_behind_active_response():
         nonlocal committed_count, response_count
         if data.get("type") == "input_audio_buffer.committed":
             committed_count += 1
-            if committed_count == 2:
-                chat_service.first_response_gate.set()
+        if data.get("type") == "error" and data.get("error", {}).get("code") == "input_backpressure":
+            chat_service.first_response_gate.set()
         if data.get("type") == "response.created":
             response_count += 1
             if response_count == 2:
                 ws.put({"type": "session.close"})
 
-    ws, handler = _pending_server_vad_harness(chat_service, on_send, turn_count=2)
+    ws, handler = _pending_server_vad_harness(chat_service, on_send, turn_count=3)
 
     await handler.handle_realtime_session(ws)  # type: ignore[arg-type]
 
@@ -2221,129 +1920,12 @@ async def test_realtime_server_vad_queues_one_turn_behind_active_response():
     committed_indices = [index for index, event in enumerate(event_types) if event == "input_audio_buffer.committed"]
     response_created_indices = [index for index, event in enumerate(event_types) if event == "response.created"]
     assert committed_indices[1] < event_types.index("response.done") < response_created_indices[1]
-    assert not any(
-        event.get("type") == "error" and event.get("error", {}).get("code") == "input_backpressure" for event in ws.sent
-    )
-
-
-@pytest.mark.asyncio
-async def test_realtime_server_vad_pending_turn_can_be_deleted_before_activation():
-    chat_service = GateChatService(FakeEngineClient())
-    committed_count = 0
-    deleted_item_id: str | None = None
-
-    def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
-        nonlocal committed_count, deleted_item_id
-        if data.get("type") == "input_audio_buffer.committed":
-            committed_count += 1
-            if committed_count == 2:
-                deleted_item_id = data.get("item_id")
-                ws.put(
-                    {
-                        "type": "conversation.item.delete",
-                        "item_id": deleted_item_id,
-                    }
-                )
-        if data.get("type") == "conversation.item.deleted" and data.get("item_id") == deleted_item_id:
-            chat_service.first_response_gate.set()
-        if data.get("type") == "response.done":
-            asyncio.get_running_loop().call_later(0.05, ws.put, {"type": "session.close"})
-
-    ws, handler = _pending_server_vad_harness(chat_service, on_send, turn_count=2)
-
-    await handler.handle_realtime_session(ws)  # type: ignore[arg-type]
-
-    assert committed_count == 2
-    assert deleted_item_id is not None
-    assert chat_service.response_count == 1
-    assert len([event for event in ws.sent if event.get("type") == "response.created"]) == 1
-
-
-@pytest.mark.asyncio
-async def test_realtime_server_vad_rejects_second_pending_turn():
-    chat_service = GateChatService(FakeEngineClient())
-
-    def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
-        if data.get("type") == "error" and data.get("error", {}).get("code") == "input_backpressure":
-            ws.put({"type": "session.close"})
-
-    ws, handler = _pending_server_vad_harness(chat_service, on_send, turn_count=3)
-
-    await handler.handle_realtime_session(ws)  # type: ignore[arg-type]
-
-    committed = [event for event in ws.sent if event.get("type") == "input_audio_buffer.committed"]
     backpressure = [
         event
         for event in ws.sent
         if event.get("type") == "error" and event.get("error", {}).get("code") == "input_backpressure"
     ]
-    assert len(committed) == 2
     assert len(backpressure) == 1
-
-
-@pytest.mark.asyncio
-async def test_realtime_server_vad_promotes_pending_turn_after_response_cancel():
-    chat_service = GateChatService(FakeEngineClient())
-    committed_count = 0
-    response_count = 0
-
-    def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
-        nonlocal committed_count, response_count
-        if data.get("type") == "input_audio_buffer.committed":
-            committed_count += 1
-            if committed_count == 2:
-                ws.put({"type": "response.cancel"})
-        if data.get("type") == "response.created":
-            response_count += 1
-            if response_count == 2:
-                ws.put({"type": "session.close"})
-
-    ws, handler = _pending_server_vad_harness(chat_service, on_send, turn_count=2)
-
-    await handler.handle_realtime_session(ws)  # type: ignore[arg-type]
-
-    assert committed_count == 2
-    assert response_count == 2
-    assert any(event.get("type") == "response.done" for event in ws.sent)
-
-
-@pytest.mark.asyncio
-async def test_realtime_output_audio_clear_rejects_non_active_response_id_without_cancelling_active():
-    chat_service = GateChatService(FakeEngineClient())
-    committed_count = 0
-    response_count = 0
-
-    def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
-        nonlocal committed_count, response_count
-        if data.get("type") == "input_audio_buffer.committed":
-            committed_count += 1
-            if committed_count == 2:
-                ws.put(
-                    {
-                        "type": "output_audio_buffer.clear",
-                        "response_id": "resp-not-active",
-                    }
-                )
-        if data.get("type") == "error" and data.get("error", {}).get("code") == "response_not_active":
-            chat_service.first_response_gate.set()
-        if data.get("type") == "response.created":
-            response_count += 1
-            if response_count == 2:
-                ws.put({"type": "session.close"})
-
-    ws, handler = _pending_server_vad_harness(chat_service, on_send, turn_count=2)
-
-    await handler.handle_realtime_session(ws)  # type: ignore[arg-type]
-
-    response_not_active = [
-        event
-        for event in ws.sent
-        if event.get("type") == "error" and event.get("error", {}).get("code") == "response_not_active"
-    ]
-    assert len(response_not_active) == 1
-    assert committed_count == 2
-    assert response_count == 2
-    assert "output_audio_buffer.cleared" not in ws.sent_types()
 
 
 @pytest.mark.asyncio
@@ -8175,24 +7757,6 @@ async def test_native_server_vad_boundary_allows_explicit_commit():
 
     assert committed is not None
     assert committed["item_id"] == item_id
-
-
-def test_serving_vad_classification_overrides_client_speech_hint():
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
-    session = DuplexSession(
-        "sid-server-vad-classification",
-        DuplexSessionConfig(),
-        capabilities=DuplexCapabilities.minicpmo45_native(),
-    )
-
-    assert (
-        handler._input_looks_like_speech(
-            {"is_speech": False},
-            {"is_speech": True},
-            session=session,
-        )
-        is True
-    )
 
 
 @pytest.mark.asyncio

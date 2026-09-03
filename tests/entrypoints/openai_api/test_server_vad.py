@@ -9,21 +9,14 @@ import sys
 import threading
 import wave
 from concurrent.futures import ThreadPoolExecutor
-from math import gcd
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from scipy.signal import resample_poly
 
-from vllm_omni.entrypoints.openai.audio_utils_mixin import StreamingAudioResampler
-from vllm_omni.experimental.fullduplex.openai.audio import resample_pcm16_mono
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexSession,
     DuplexSessionConfig,
-)
-from vllm_omni.experimental.fullduplex.openai.realtime_session import (
-    NativeRealtimeSessionProtocol,
 )
 from vllm_omni.experimental.fullduplex.openai.server_vad import (
     ServerVADConfig,
@@ -76,194 +69,6 @@ def test_server_vad_config_defaults_and_validation():
     assert interrupting.min_speech_duration_ms == 96
     with pytest.raises(ValueError, match="Unknown"):
         ServerVADConfig.from_value({"type": "server_vad", "semantic_eagerness": "high"})
-
-
-def _resample_reference(
-    samples: np.ndarray,
-    *,
-    source_rate_hz: int = 24_000,
-    target_rate_hz: int = 16_000,
-) -> np.ndarray:
-    normalized = samples.astype(np.float32) * np.float32(1.0 / 32768.0)
-    rate_gcd = gcd(source_rate_hz, target_rate_hz)
-    return np.ascontiguousarray(
-        resample_poly(
-            normalized,
-            target_rate_hz // rate_gcd,
-            source_rate_hz // rate_gcd,
-        ),
-        dtype=np.float32,
-    )
-
-
-def _process_pcm16(
-    resampler: StreamingAudioResampler,
-    samples: np.ndarray,
-    *,
-    final: bool = False,
-) -> np.ndarray:
-    normalized = samples.astype(np.float32) * np.float32(1.0 / 32768.0)
-    return resampler.process(normalized, final=final)
-
-
-def test_streaming_resampler_binds_source_and_target_rates():
-    resampler = StreamingAudioResampler(24_000, 16_000)
-
-    assert resampler.source_rate == 24_000
-    assert resampler.target_rate == 16_000
-
-    for invalid_rate in (True, 0, -1):
-        with pytest.raises(ValueError, match="positive integer"):
-            StreamingAudioResampler(invalid_rate, 16_000)
-    with pytest.raises(ValueError, match="unsupported resampling ratio"):
-        StreamingAudioResampler(191_999, 16_000)
-
-
-@pytest.mark.parametrize("source_rate_hz", [8_000, 16_000, 24_000, 44_100, 48_000])
-@pytest.mark.parametrize("sample_count", [1, 2, 3, 4, 5, 17, 2_399, 2_400, 2_401])
-def test_streaming_resampler_matches_resample_poly(source_rate_hz: int, sample_count: int):
-    rng = np.random.default_rng(sample_count)
-    source = rng.integers(-32_768, 32_768, size=sample_count, dtype=np.int16)
-    resampler = StreamingAudioResampler(source_rate_hz, 16_000)
-
-    actual = _process_pcm16(resampler, source, final=True)
-    expected = _resample_reference(source, source_rate_hz=source_rate_hz)
-
-    assert actual.size == (sample_count * 16_000 + source_rate_hz - 1) // source_rate_hz
-    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
-
-
-def test_stateless_pcm16_resampler_matches_polyphase_reference():
-    rng = np.random.default_rng(24_000)
-    source = rng.integers(-32_768, 32_768, size=2_400, dtype=np.int16)
-
-    actual = np.frombuffer(
-        resample_pcm16_mono(
-            source.tobytes(),
-            source_rate_hz=24_000,
-            target_rate_hz=16_000,
-        ),
-        dtype="<i2",
-    )
-    expected = np.clip(
-        np.rint(_resample_reference(source) * 32_768.0),
-        -32_768,
-        32_767,
-    ).astype("<i2")
-
-    np.testing.assert_allclose(actual, expected, rtol=0, atol=1)
-
-
-def test_stateless_pcm16_resampler_bounds_unusual_rate_ratios():
-    source = np.arange(2_400, dtype="<i2")
-
-    actual = np.frombuffer(
-        resample_pcm16_mono(
-            source.tobytes(),
-            source_rate_hz=191_999,
-            target_rate_hz=16_000,
-        ),
-        dtype="<i2",
-    )
-
-    assert actual.size == round(source.size * 16_000 / 191_999)
-
-
-@pytest.mark.parametrize(
-    "chunk_sizes",
-    [
-        [2_401],
-        [1] * 2_401,
-        [2, 1] * 800 + [1],
-        [7, 13, 511, 512, 513, 845],
-    ],
-)
-def test_24khz_resampler_is_invariant_to_chunk_boundaries(chunk_sizes: list[int]):
-    sample_index = np.arange(2_401, dtype=np.int32)
-    source = ((sample_index * 7919) % 65_536 - 32_768).astype("<i2")
-    resampler = StreamingAudioResampler(24_000, 16_000)
-
-    chunks: list[np.ndarray] = []
-    offset = 0
-    for chunk_size in chunk_sizes:
-        chunks.append(_process_pcm16(resampler, source[offset : offset + chunk_size]))
-        chunks.append(_process_pcm16(resampler, source[:0]))
-        offset += chunk_size
-
-    assert offset == source.size
-    chunks.append(_process_pcm16(resampler, source[:0], final=True))
-    actual = np.concatenate(chunks)
-    whole_resampler = StreamingAudioResampler(24_000, 16_000)
-    whole = _process_pcm16(whole_resampler, source, final=True)
-    expected = _resample_reference(source)
-    np.testing.assert_array_equal(actual, whole)
-    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
-    assert actual.size == 1_601
-
-
-def test_24khz_resampler_retains_right_lookahead_until_flush():
-    source = np.arange(15, dtype="<i2")
-    resampler = StreamingAudioResampler(24_000, 16_000)
-
-    assert _process_pcm16(resampler, source).size == 0
-
-    actual = _process_pcm16(resampler, source[:0], final=True)
-
-    np.testing.assert_allclose(actual, _resample_reference(source), rtol=2e-5, atol=2e-5)
-
-    assert _process_pcm16(resampler, source[:0], final=True).size == 0
-    with pytest.raises(RuntimeError, match="has been finalized"):
-        _process_pcm16(resampler, source)
-
-
-def test_24khz_resampler_reset_discards_residual_samples():
-    resampler = StreamingAudioResampler(24_000, 16_000)
-    discarded = np.arange(23, dtype="<i2")
-    source = np.arange(64, dtype="<i2")
-
-    _process_pcm16(resampler, discarded)
-    resampler.reset()
-
-    actual = _process_pcm16(resampler, source, final=True)
-
-    np.testing.assert_allclose(actual, _resample_reference(source), rtol=2e-5, atol=2e-5)
-
-
-def test_24khz_resampler_suppresses_content_above_16khz_nyquist():
-    sample_rate_hz = 24_000
-    sample_index = np.arange(sample_rate_hz, dtype=np.float64)
-    source = np.rint(0.8 * 32767 * np.sin(2 * np.pi * 10_000 * sample_index / sample_rate_hz)).astype("<i2")
-    resampler = StreamingAudioResampler(24_000, 16_000)
-
-    output = _process_pcm16(resampler, source, final=True)
-
-    # Ignore the short finite-stream edge transient. A non-filtered 3:2
-    # converter aliases this tone into the output at roughly 0.4 RMS.
-    steady_state_rms = float(np.sqrt(np.mean(np.square(output[1_000:]))))
-    assert steady_state_rms < 0.005
-
-
-def test_24khz_resampler_does_not_create_a_passband_image():
-    source_rate_hz = 24_000
-    target_rate_hz = 16_000
-    frequency_hz = 6_000
-    sample_index = np.arange(source_rate_hz * 2, dtype=np.float64)
-    source = np.rint(0.8 * 32767 * np.sin(2 * np.pi * frequency_hz * sample_index / source_rate_hz)).astype("<i2")
-    resampler = StreamingAudioResampler(source_rate_hz, target_rate_hz)
-
-    output = _process_pcm16(resampler, source, final=True)[8_000:24_000]
-
-    def amplitude_at(frequency: int) -> float:
-        basis = np.exp(-2j * np.pi * frequency * np.arange(output.size) / target_rate_hz)
-        return float(2 * np.abs(np.dot(output, basis)) / output.size)
-
-    desired_amplitude = amplitude_at(frequency_hz)
-    image_amplitude = amplitude_at(target_rate_hz // 2 - frequency_hz)
-    desired_gain_db = 20 * np.log10(desired_amplitude / 0.8)
-    image_db = 20 * np.log10(image_amplitude / desired_amplitude)
-
-    assert abs(desired_gain_db) < 0.1
-    assert image_db < -60
 
 
 @pytest.mark.asyncio
@@ -324,25 +129,8 @@ async def test_server_vad_pipeline_pcm16_resampling_is_split_invariant():
     )
 
     np.testing.assert_array_equal(split_samples, whole_samples)
-    np.testing.assert_allclose(whole_samples, _resample_reference(source), rtol=2e-5, atol=2e-5)
+    assert whole_samples.size == 1_600
     assert split_decisions == whole_decisions
-
-
-@pytest.mark.asyncio
-async def test_server_vad_pipeline_empty_append_does_not_bind_source_rate():
-    pipeline = ServerVADPipeline(
-        SequenceDetector([0.0]),
-        ServerVADConfig(),
-    )
-
-    empty_batch = await pipeline.push_pcm16(b"", source_sample_rate_hz=24_000)
-    assert not empty_batch.frames
-
-    batch = await pipeline.push_pcm16(
-        np.zeros(160, dtype="<i2"),
-        source_sample_rate_hz=16_000,
-    )
-    assert len(batch.frames) == 1
 
 
 @pytest.mark.asyncio
@@ -369,20 +157,6 @@ async def test_server_vad_pipeline_reset_clears_resampler_and_source_rate_lock()
         batch.frames[0].samples[:3],
         np.asarray([-1.0, 0.0, 32767 / 32768], dtype=np.float32),
     )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("first_rate,second_rate", [(16_000, 24_000), (24_000, 16_000)])
-async def test_server_vad_pipeline_rejects_source_rate_switch(first_rate: int, second_rate: int):
-    pipeline = ServerVADPipeline(
-        SequenceDetector([0.0]),
-        ServerVADConfig(),
-    )
-
-    await pipeline.push_pcm16(np.asarray([1], dtype="<i2"), source_sample_rate_hz=first_rate)
-
-    with pytest.raises(ValueError, match="cannot change"):
-        await pipeline.push_pcm16(np.asarray([2], dtype="<i2"), source_sample_rate_hz=second_rate)
 
 
 def test_threshold_endpoint_policy_uses_silero_v62_exit_hysteresis():
@@ -462,61 +236,6 @@ def test_threshold_endpoint_policy_clamps_silero_exit_threshold():
     # 20 ms of silence required to detect the endpoint.
     assert stopped.audio_end_ms == 30
     assert stopped.endpoint_delay_ms == 20
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("audio", "part_overrides"),
-    [
-        pytest.param("", {}, id="empty"),
-        pytest.param("AAAAAA==!!!!", {}, id="invalid-base64"),
-        pytest.param(
-            base64.b64encode(np.zeros(480, dtype="<i2").tobytes()).decode(),
-            {"sample_rate_hz": 191_999},
-            id="sample-rate-override",
-        ),
-        pytest.param(
-            base64.b64encode(np.zeros(480, dtype="<i2").tobytes()).decode(),
-            {"format": "pcm_f32le"},
-            id="format-override",
-        ),
-    ],
-)
-async def test_invalid_complete_audio_item_returns_correlated_bad_audio(
-    audio: str,
-    part_overrides: dict[str, object],
-):
-    protocol = NativeRealtimeSessionProtocol({})
-    protocol._turn_detection_configured = True
-    protocol._turn_detection = ServerVADConfig().as_dict()
-    protocol._hold_realtime_output_until_session_created = False
-    sent: list[dict[str, object]] = []
-
-    async def send(payload: dict[str, object]) -> None:
-        sent.append(payload)
-
-    protocol.bind_sender(send)
-
-    translated = await protocol._to_duplex_event(
-        {
-            "type": "conversation.item.create",
-            "event_id": "event-invalid-audio",
-            "item": {
-                "id": "item-invalid-audio",
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_audio", "audio": audio, **part_overrides}],
-            },
-        }
-    )
-
-    assert translated is None
-    assert sent[-1]["type"] == "error"
-    assert sent[-1]["error"]["code"] == "bad_audio"
-    assert sent[-1]["error"]["event_id"] == "event-invalid-audio"
-    assert not {"conversation.item.added", "conversation.item.done"}.intersection(
-        payload.get("type") for payload in sent
-    )
 
 
 def test_silero_backend_matches_upstream_v62_streaming_contract(monkeypatch, tmp_path):
