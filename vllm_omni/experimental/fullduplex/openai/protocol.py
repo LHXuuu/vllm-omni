@@ -394,7 +394,7 @@ class DuplexCommittedInput:
 class PendingServerVADTurn:
     committed: DuplexCommittedInput
     create_response: bool
-    item_id: str | None = None
+    item_id: str
 
 
 @dataclass
@@ -892,7 +892,7 @@ class DuplexSession:
         committed: DuplexCommittedInput,
         *,
         create_response: bool,
-        item_id: str | None,
+        item_id: str,
     ) -> None:
         if self._input.pending_server_vad_turn is not None:
             raise RuntimeError("A Server VAD turn is already pending")
@@ -913,8 +913,7 @@ class DuplexSession:
             return None
         self._input.pending_server_vad_turn = None
         self._conversation.messages.append(pending.committed.message)
-        if pending.item_id:
-            self.register_history_item(pending.item_id, pending.committed.message)
+        self.register_history_item(pending.item_id, pending.committed.message)
         self.turn_state = DuplexTurnState.USER_COMMITTED
         return pending
 

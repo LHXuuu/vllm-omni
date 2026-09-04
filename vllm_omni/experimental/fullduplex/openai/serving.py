@@ -113,6 +113,7 @@ class OmniDuplexSessionHandler(
         served_model_name: str | None = None,
         config_timeout_s: float = _DEFAULT_CONFIG_TIMEOUT_S,
         idle_timeout_s: float = _DEFAULT_IDLE_TIMEOUT_S,
+        log_stats: bool = True,
         duplex_session_config: DuplexSessionRuntimeConfig | None = None,
         serving_runtime_adapter: ServingRuntimeAdapter | None = None,
         serving_runtime_adapter_path: str | None = None,
@@ -126,9 +127,10 @@ class OmniDuplexSessionHandler(
             model_path=self._duplex_session_config.server_vad_model_path,
         )
         self._server_vad_pipelines: dict[str, ServerVADPipeline] = {}
-        self._server_vad_metrics_model_name = served_model_name or chat_service.model_config.model
-        self._server_vad_metric_models: dict[str, str] = {}
-        self._realtime_vad_metrics = RealtimeVADMetrics()
+        self._realtime_vad_metrics = RealtimeVADMetrics(
+            served_model_name or chat_service.model_config.model,
+            log_stats=log_stats,
+        )
         self._registry = DuplexSessionRegistry(
             DuplexCapabilities(
                 supports_model_native_turn_policy=False,
@@ -818,13 +820,6 @@ class OmniDuplexSessionHandler(
             return adapter.create_session_state()
         return TurnBasedServingSessionState()
 
-    def _store_runtime_session_state(
-        self,
-        session_id: str,
-        state: ServingRuntimeSessionState,
-    ) -> None:
-        self._serving_session_states[session_id] = state
-
     def _runtime_session_state(self, session: DuplexSession) -> ServingRuntimeSessionState:
         adapter = self._serving_runtime_adapter
         if adapter is not None:
@@ -1000,15 +995,9 @@ class OmniDuplexSessionHandler(
             return None
         if config.idle_timeout_s == _DEFAULT_IDLE_TIMEOUT_S:
             config.idle_timeout_s = self._idle_timeout_s
-        use_native_runtime = self._uses_serving_runtime_adapter(config)
-        runtime_adapter = self._serving_runtime_adapter
-        runtime_capabilities = (
-            runtime_adapter.capabilities(max_sessions=self._duplex_session_config.max_sessions)
-            if use_native_runtime and runtime_adapter is not None
-            else None
-        )
+        runtime_adapter = self._serving_runtime_adapter if self._uses_serving_runtime_adapter(config) else None
         runtime_config: dict[str, object] = {}
-        if use_native_runtime and runtime_adapter is not None:
+        if runtime_adapter is not None:
             try:
                 runtime_config = await runtime_adapter.prepare_runtime_config(
                     config,
@@ -1022,8 +1011,10 @@ class OmniDuplexSessionHandler(
                 return None
         session_id = event.get("session_id") if isinstance(event.get("session_id"), str) else None
         session = self._registry.create(config=config, session_id=session_id)
-        if runtime_capabilities is not None:
-            session.replace_capabilities(runtime_capabilities)
+        if runtime_adapter is not None:
+            session.replace_capabilities(
+                runtime_adapter.capabilities(max_sessions=self._duplex_session_config.max_sessions)
+            )
             session.replace_runtime_config(runtime_config)
         event_id = event.get("_realtime_event_id")
         return _DuplexSessionHandshake(
@@ -1655,15 +1646,11 @@ class OmniDuplexSessionHandler(
         existing = self._server_vad_pipelines.pop(session.session_id, None)
         if existing is not None:
             existing.reset()
-        previous_model = self._server_vad_metric_models.pop(session.session_id, None)
-        if previous_model is not None:
-            self._realtime_vad_metrics.session_finished(previous_model)
+            self._realtime_vad_metrics.session_finished()
         if pipeline is None:
             return
         self._server_vad_pipelines[session.session_id] = pipeline
-        model_name = self._server_vad_metrics_model_name
-        self._server_vad_metric_models[session.session_id] = model_name
-        self._realtime_vad_metrics.session_started(model_name)
+        self._realtime_vad_metrics.session_started()
 
     async def _prepare_server_vad_pipeline(
         self,

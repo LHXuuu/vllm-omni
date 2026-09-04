@@ -381,9 +381,6 @@ def test_silero_provider_rejects_missing_or_invalid_local_artifact(tmp_path):
 
     invalid_path = tmp_path / "silero_vad.onnx"
     invalid_path.write_bytes(b"not-the-pinned-model")
-    invalid = SileroVADBackendProvider(
-        model_path=str(invalid_path),
-        sha256="0" * 64,
-    )
+    invalid = SileroVADBackendProvider(model_path=str(invalid_path))
     with pytest.raises(RuntimeError, match="checksum mismatch"):
         invalid.get()

@@ -38,17 +38,14 @@ class ChatFallbackProjectorMixin:
             request = self._build_chat_request(session, request_id)
             result = await self._chat_service.create_chat_completion(request, raw_request=None)
             if isinstance(result, ErrorResponse):
-                error_info = getattr(result, "error", None)
-                error_message = (
-                    getattr(error_info, "message", None) or getattr(result, "message", None) or "Chat request failed"
+                error = result.error
+                await send_json(
+                    {
+                        "type": "error",
+                        "error": error.message if error else "Chat request failed",
+                        "code": error.type if error else "chat_error",
+                    }
                 )
-                error_code = (
-                    getattr(error_info, "code", None)
-                    or getattr(error_info, "type", None)
-                    or getattr(result, "type", None)
-                    or "chat_error"
-                )
-                await send_json({"type": "error", "error": error_message, "code": error_code})
                 session.end_response(commit_text=False)
                 return
             if hasattr(result, "__aiter__"):
@@ -178,7 +175,7 @@ class ChatFallbackProjectorMixin:
             try:
                 parsed = json.loads(data)
             except json.JSONDecodeError:
-                logger.debug("Skipping non-JSON duplex stream payload (chars=%d)", len(data))
+                logger.debug("Skipping non-JSON duplex stream payload: %s", data)
                 continue
             if isinstance(parsed, dict):
                 payloads.append(parsed)

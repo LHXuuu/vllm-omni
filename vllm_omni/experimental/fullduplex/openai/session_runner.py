@@ -295,12 +295,6 @@ class DuplexSessionRunnerMixin:
                 return True
             return False
 
-        def chat_response_in_progress() -> bool:
-            # The actor retains response ownership until its terminal event is
-            # consumed, even if the task has just completed. This prevents a
-            # queued audio event from overtaking pending-turn activation.
-            return actor.active_response_task is not None
-
         def start_chat_response() -> None:
             assert session is not None
 
@@ -343,10 +337,7 @@ class DuplexSessionRunnerMixin:
             assert session is not None
             session.cancel_pending_input()
             pipeline.reset()
-            self._realtime_vad_metrics.error(
-                self._server_vad_metrics_model_name,
-                metric_reason,
-            )
+            self._realtime_vad_metrics.error(metric_reason)
             await emit_event(
                 correlate_realtime_error(
                     {
@@ -373,14 +364,13 @@ class DuplexSessionRunnerMixin:
             event_id: object = None,
         ) -> None:
             assert session is not None
-            active_response = chat_response_in_progress()
+            # Retain ownership until the actor consumes the terminal event so
+            # queued audio cannot overtake pending-turn activation.
+            active_response = actor.active_response_task is not None
             if active_response and session.pending_server_vad_turn is not None:
                 released = session.discard_uncommitted_server_vad_utterance()
                 session.release_input_bytes(released)
-                self._realtime_vad_metrics.error(
-                    self._server_vad_metrics_model_name,
-                    "pending_turn_backpressure",
-                )
+                self._realtime_vad_metrics.error("pending_turn_backpressure")
                 await emit_event(
                     correlate_realtime_error(
                         {
@@ -830,7 +820,7 @@ class DuplexSessionRunnerMixin:
                 self._ensure_lifecycle_listener()
                 reader_task = asyncio.create_task(read_event_loop(), name="duplex-session-reader")
             else:
-                self._store_runtime_session_state(session.session_id, native)
+                self._serving_session_states[session.session_id] = native
                 self._session_tasks[session.session_id] = actor.tasks
                 if realtime_protocol is not None:
                     self._realtime_protocols[session.session_id] = realtime_protocol
@@ -846,10 +836,7 @@ class DuplexSessionRunnerMixin:
                     await self._configure_server_vad(session)
                 except Exception as exc:
                     logger.exception("Server VAD initialization failed: %s", exc)
-                    self._realtime_vad_metrics.error(
-                        self._server_vad_metrics_model_name,
-                        "initialization",
-                    )
+                    self._realtime_vad_metrics.error("initialization")
                     await emit_event(
                         correlate_realtime_error(
                             {
@@ -1093,7 +1080,7 @@ class DuplexSessionRunnerMixin:
                         turn_id=session.turn_id,
                         incarnation=session.incarnation,
                     )
-                    if event_type in {"response.cancel", "output_audio_buffer.clear"}:
+                    if event_type == "response.cancel":
                         requested_response_id = event.get("response_id")
                         has_active_response_work = native_response_in_progress()
                         if isinstance(requested_response_id, str) and (
@@ -1241,8 +1228,7 @@ class DuplexSessionRunnerMixin:
                     ):
                         continue
                     actor.active_response_task = None
-                    if event_type in {"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"}:
-                        activate_waiting_server_vad_turn()
+                    activate_waiting_server_vad_turn()
                     continue
 
                 if event_type == "turn.signal":
@@ -1356,10 +1342,7 @@ class DuplexSessionRunnerMixin:
                                     )
                                 except Exception as exc:
                                     logger.exception("Server VAD session update failed: %s", exc)
-                                    self._realtime_vad_metrics.error(
-                                        self._server_vad_metrics_model_name,
-                                        "initialization",
-                                    )
+                                    self._realtime_vad_metrics.error("initialization")
                                     await emit_update_event(
                                         {
                                             "type": "error",
@@ -1378,8 +1361,6 @@ class DuplexSessionRunnerMixin:
                                 runtime_config=candidate_runtime_config,
                             )
                             if not runtime_updated:
-                                if candidate_server_vad_pipeline is not None:
-                                    candidate_server_vad_pipeline.reset()
                                 reject_update()
                                 continue
                             session.replace_config(candidate_config)
@@ -1569,9 +1550,9 @@ class DuplexSessionRunnerMixin:
                     sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
                     sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else default_sample_rate_hz
                     native_input = self._uses_native_input_append(session)
-                    server_vad_input = session.config.server_vad is not None and not native_input
-                    native_server_vad_input = session.config.server_vad is not None and native_input
-                    if not server_vad_input:
+                    server_vad_config = session.config.server_vad
+                    turn_based_server_vad = server_vad_config is not None and not native_input
+                    if not turn_based_server_vad:
                         try:
                             audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
                                 audio,
@@ -1590,7 +1571,7 @@ class DuplexSessionRunnerMixin:
                                 }
                             )
                             continue
-                        if not native_server_vad_input:
+                        if server_vad_config is None:
                             session.lock_turn_detection_config()
                     force_listen = bool(event.get("force_listen", False))
                     payload = {
@@ -1605,7 +1586,7 @@ class DuplexSessionRunnerMixin:
                         frames = [frame for frame in video_frames if isinstance(frame, str) and frame]
                         if frames:
                             payload["video_frames"] = frames
-                    if native_server_vad_input:
+                    if server_vad_config is not None:
                         realtime_event_id = event.get("_realtime_event_id")
                         pipeline = self._server_vad_pipelines.get(session.session_id)
                         if pipeline is None:
@@ -1621,13 +1602,41 @@ class DuplexSessionRunnerMixin:
                                 )
                             )
                             continue
+                        speech_was_active = pipeline.speech_active
+                        reserved_bytes = 0
+                        previous_scratch_bytes = pipeline.scratch_bytes
                         try:
-                            if fmt != "pcm_f32le" or sample_rate_hz != pipeline.sample_rate_hz:
-                                raise ValueError("native server_vad input must be mono PCM float32 at 16000 Hz")
-                            raw_audio = base64.b64decode(audio, validate=True)
-                            if len(raw_audio) % np.dtype("<f4").itemsize:
-                                raise ValueError("native server_vad input contains an incomplete float32 sample")
-                            normalized_audio = np.frombuffer(raw_audio, dtype="<f4")
+                            if native_input:
+                                if fmt != "pcm_f32le" or sample_rate_hz != pipeline.sample_rate_hz:
+                                    raise ValueError("native server_vad input must be mono PCM float32 at 16000 Hz")
+                                raw_audio = base64.b64decode(audio, validate=True)
+                                if len(raw_audio) % np.dtype("<f4").itemsize:
+                                    raise ValueError("native server_vad input contains an incomplete float32 sample")
+                                normalized_audio = np.frombuffer(raw_audio, dtype="<f4")
+                                accepted_audio = normalized_audio.size > 0
+                            else:
+                                if fmt != "pcm16":
+                                    raise ValueError("server_vad input must be mono PCM16")
+                                source_sample_rate_hz = validate_input_sample_rate_hz(sample_rate_hz)
+                                if source_sample_rate_hz not in {16_000, 24_000}:
+                                    raise ValueError("server_vad PCM16 input sample rate must be 16000 or 24000 Hz")
+                                if (
+                                    pipeline.source_sample_rate_hz is not None
+                                    and source_sample_rate_hz != pipeline.source_sample_rate_hz
+                                ):
+                                    raise ValueError(
+                                        "server_vad input sample rate cannot change within a continuous audio stream"
+                                    )
+                                try:
+                                    raw_audio = base64.b64decode(audio, validate=True)
+                                except (binascii.Error, ValueError) as exc:
+                                    raise ValueError(
+                                        "server_vad input audio must be valid base64-encoded PCM16"
+                                    ) from exc
+                                if len(raw_audio) % np.dtype("<i2").itemsize:
+                                    raise ValueError("server_vad PCM16 input contains an incomplete sample")
+                                source_samples = len(raw_audio) // np.dtype("<i2").itemsize
+                                accepted_audio = source_samples > 0
                         except (binascii.Error, ValueError) as exc:
                             await emit_event(
                                 correlate_realtime_error(
@@ -1642,9 +1651,34 @@ class DuplexSessionRunnerMixin:
                                 )
                             )
                             continue
-                        speech_was_active = pipeline.speech_active
+                        if not native_input:
+                            normalized_sample_upper_bound = (
+                                source_samples
+                                if source_sample_rate_hz == pipeline.sample_rate_hz
+                                else ((source_samples + 2) // 3) * 2
+                            )
+                            reserved_bytes = normalized_sample_upper_bound * np.dtype(np.float32).itemsize
+                            if not session.reserve_input_bytes(
+                                reserved_bytes,
+                                limit=self._duplex_session_config.max_pending_input_bytes_per_session,
+                            ):
+                                await reject_and_clear_server_vad_input(
+                                    pipeline,
+                                    code="input_backpressure",
+                                    error="Server VAD input exceeds the per-session input limit",
+                                    metric_reason="input_backpressure",
+                                    event_id=realtime_event_id,
+                                )
+                                continue
                         try:
-                            vad_batch = await pipeline.push(normalized_audio)
+                            vad_batch = (
+                                await pipeline.push(normalized_audio)
+                                if native_input
+                                else await pipeline.push_pcm16(
+                                    raw_audio,
+                                    source_sample_rate_hz=source_sample_rate_hz,
+                                )
+                            )
                         except Exception as exc:
                             logger.exception("Server VAD inference failed: %s", exc)
                             await reject_and_clear_server_vad_input(
@@ -1655,14 +1689,27 @@ class DuplexSessionRunnerMixin:
                                 event_id=realtime_event_id,
                             )
                             continue
-                        self._realtime_vad_metrics.observe_inference(
-                            self._server_vad_metrics_model_name,
-                            vad_batch.inference_ms,
-                        )
+                        if not native_input:
+                            retained_delta = (
+                                sum(frame.samples.nbytes for frame in vad_batch.frames)
+                                + pipeline.scratch_bytes
+                                - previous_scratch_bytes
+                            )
+                            session.release_input_bytes(max(0, reserved_bytes - retained_delta))
+                        self._realtime_vad_metrics.observe_inference(vad_batch.inference_ms)
+                        prefix_samples = round(server_vad_config.prefix_padding_ms * pipeline.sample_rate_hz / 1000)
                         speech_started = False
                         speech_stopped = False
-                        for vad_frame in vad_batch.frames:
+                        for frame_index, vad_frame in enumerate(vad_batch.frames):
                             decision = vad_frame.decision
+                            if not native_input:
+                                released_bytes = session.append_server_vad_frame(
+                                    vad_frame.samples,
+                                    speech_started=decision.speech_started,
+                                    speech_stopped=decision.speech_stopped,
+                                    prefix_samples=prefix_samples,
+                                )
+                                session.release_input_bytes(released_bytes)
                             if decision.speech_started:
                                 speech_started = True
                                 item_id = f"item_{uuid.uuid4().hex}"
@@ -1687,10 +1734,21 @@ class DuplexSessionRunnerMixin:
                                     }
                                 )
                                 if decision.endpoint_delay_ms is not None:
-                                    self._realtime_vad_metrics.observe_endpoint_delay(
-                                        self._server_vad_metrics_model_name,
-                                        decision.endpoint_delay_ms,
+                                    self._realtime_vad_metrics.observe_endpoint_delay(decision.endpoint_delay_ms)
+                                if not native_input:
+                                    remaining_frame_bytes = sum(
+                                        frame.samples.nbytes for frame in vad_batch.frames[frame_index + 1 :]
                                     )
+                                    await commit_server_vad_turn(
+                                        item_id=item_id,
+                                        create_response=server_vad_config.create_response,
+                                        retain_input_bytes=remaining_frame_bytes + pipeline.scratch_bytes,
+                                        event_id=realtime_event_id,
+                                    )
+                        if accepted_audio:
+                            session.lock_turn_detection_config()
+                        if not native_input:
+                            continue
                         speech_active = pipeline.speech_active
                         contained_speech = speech_was_active or speech_started or speech_stopped or speech_active
                         payload["is_speech"] = contained_speech
@@ -1703,157 +1761,11 @@ class DuplexSessionRunnerMixin:
                         }
                         if speech_active:
                             payload["force_listen"] = True
-                        if normalized_audio.size:
-                            session.lock_turn_detection_config()
-                    if server_vad_input:
-                        realtime_event_id = event.get("_realtime_event_id")
-                        pipeline = self._server_vad_pipelines.get(session.session_id)
-                        if pipeline is None:
-                            await emit_event(
-                                correlate_realtime_error(
-                                    {
-                                        "type": "error",
-                                        "session_id": session.session_id,
-                                        "code": "internal_error",
-                                        "error": "server_vad is configured but its detector pipeline is unavailable",
-                                    },
-                                    realtime_event_id,
-                                )
-                            )
-                            continue
-                        try:
-                            if fmt != "pcm16":
-                                raise ValueError("server_vad input must be mono PCM16")
-                            source_sample_rate_hz = validate_input_sample_rate_hz(sample_rate_hz)
-                            if source_sample_rate_hz not in {16_000, 24_000}:
-                                raise ValueError("server_vad PCM16 input sample rate must be 16000 or 24000 Hz")
-                            if (
-                                pipeline.source_sample_rate_hz is not None
-                                and source_sample_rate_hz != pipeline.source_sample_rate_hz
-                            ):
-                                raise ValueError(
-                                    "server_vad input sample rate cannot change within a continuous audio stream"
-                                )
-                            try:
-                                raw_audio = base64.b64decode(audio, validate=True)
-                            except (binascii.Error, ValueError) as exc:
-                                raise ValueError("server_vad input audio must be valid base64-encoded PCM16") from exc
-                            if len(raw_audio) % np.dtype("<i2").itemsize:
-                                raise ValueError("server_vad PCM16 input contains an incomplete sample")
-                            source_samples = len(raw_audio) // np.dtype("<i2").itemsize
-                        except (binascii.Error, ValueError) as exc:
-                            await emit_event(
-                                correlate_realtime_error(
-                                    {
-                                        "type": "error",
-                                        "session_id": session.session_id,
-                                        "code": "bad_audio",
-                                        "error": str(exc),
-                                        "param": "audio",
-                                    },
-                                    realtime_event_id,
-                                )
-                            )
-                            continue
-                        previous_scratch_bytes = pipeline.scratch_bytes
-                        normalized_sample_upper_bound = (
-                            source_samples
-                            if source_sample_rate_hz == pipeline.sample_rate_hz
-                            else ((source_samples + 2) // 3) * 2
-                        )
-                        reserved_bytes = normalized_sample_upper_bound * np.dtype(np.float32).itemsize
-                        if not session.reserve_input_bytes(
-                            reserved_bytes,
-                            limit=self._duplex_session_config.max_pending_input_bytes_per_session,
-                        ):
-                            await reject_and_clear_server_vad_input(
-                                pipeline,
-                                code="input_backpressure",
-                                error="Server VAD input exceeds the per-session input limit",
-                                metric_reason="input_backpressure",
-                                event_id=realtime_event_id,
-                            )
-                            continue
-                        try:
-                            vad_batch = await pipeline.push_pcm16(
-                                raw_audio,
-                                source_sample_rate_hz=source_sample_rate_hz,
-                            )
-                        except Exception as exc:
-                            logger.exception("Server VAD inference failed: %s", exc)
-                            await reject_and_clear_server_vad_input(
-                                pipeline,
-                                code="server_vad_inference_failed",
-                                error=str(exc),
-                                metric_reason="inference",
-                                event_id=realtime_event_id,
-                            )
-                            continue
-                        retained_delta = (
-                            sum(frame.samples.nbytes for frame in vad_batch.frames)
-                            + pipeline.scratch_bytes
-                            - previous_scratch_bytes
-                        )
-                        session.release_input_bytes(max(0, reserved_bytes - retained_delta))
-                        self._realtime_vad_metrics.observe_inference(
-                            self._server_vad_metrics_model_name,
-                            vad_batch.inference_ms,
-                        )
-                        prefix_samples = round(
-                            session.config.server_vad.prefix_padding_ms * pipeline.sample_rate_hz / 1000
-                        )
-                        for frame_index, vad_frame in enumerate(vad_batch.frames):
-                            released_bytes = session.append_server_vad_frame(
-                                vad_frame.samples,
-                                speech_started=vad_frame.decision.speech_started,
-                                speech_stopped=vad_frame.decision.speech_stopped,
-                                prefix_samples=prefix_samples,
-                            )
-                            session.release_input_bytes(released_bytes)
-                            if vad_frame.decision.speech_started:
-                                item_id = f"item_{uuid.uuid4().hex}"
-                                session.begin_server_vad_speech(item_id)
-                                await emit_event(
-                                    {
-                                        "type": "input_audio_buffer.speech_started",
-                                        "session_id": session.session_id,
-                                        "item_id": item_id,
-                                        "audio_start_ms": vad_frame.decision.audio_start_ms or 0,
-                                    }
-                                )
-                            if vad_frame.decision.speech_stopped:
-                                item_id = session.finish_server_vad_speech() or f"item_{uuid.uuid4().hex}"
-                                await emit_event(
-                                    {
-                                        "type": "input_audio_buffer.speech_stopped",
-                                        "session_id": session.session_id,
-                                        "item_id": item_id,
-                                        "audio_end_ms": vad_frame.decision.audio_end_ms or 0,
-                                    }
-                                )
-                                if vad_frame.decision.endpoint_delay_ms is not None:
-                                    self._realtime_vad_metrics.observe_endpoint_delay(
-                                        self._server_vad_metrics_model_name,
-                                        vad_frame.decision.endpoint_delay_ms,
-                                    )
-                                remaining_frame_bytes = sum(
-                                    frame.samples.nbytes for frame in vad_batch.frames[frame_index + 1 :]
-                                )
-                                await commit_server_vad_turn(
-                                    item_id=item_id,
-                                    create_response=session.config.server_vad.create_response,
-                                    retain_input_bytes=remaining_frame_bytes + pipeline.scratch_bytes,
-                                    event_id=realtime_event_id,
-                                )
-                        accepted_audio = source_samples > 0
-                        if accepted_audio:
-                            session.lock_turn_detection_config()
-                        continue
                     # Speech/silence tag for the Stage0 turn-ended latch.
                     payload["is_speech"] = self._input_looks_like_speech(event, payload, session=session)
                     defer_native_append = False
                     buffer_overlap_audio = True
-                    if self._uses_native_input_append(session):
+                    if native_input:
                         mark_pending_silence_superseded()
                         overlap_active = native_response_in_progress() and (
                             not self._session_auto_responds(session)
@@ -2039,7 +1951,7 @@ class DuplexSessionRunnerMixin:
                         payload = pcm_reservation.payload
                     else:
                         session.append_audio(audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
-                    if self._uses_native_input_append(session):
+                    if native_input:
                         await start_native_append(
                             payload,
                             final=False,
@@ -2054,7 +1966,7 @@ class DuplexSessionRunnerMixin:
                     if (
                         event_type == "response.create"
                         and session.config.server_vad is not None
-                        and chat_response_in_progress()
+                        and actor.active_response_task is not None
                     ):
                         await emit_event(
                             {
@@ -2471,7 +2383,10 @@ class DuplexSessionRunnerMixin:
                             emit_event,
                             reason="new_response",
                         )
-                    start_chat_response()
+                    if session.config.server_vad is not None and not self._uses_native_input_append(session):
+                        start_chat_response()
+                    else:
+                        actor.active_response_task = asyncio.create_task(self._run_response(session, emit_event))
                     continue
 
                 await emit_event(

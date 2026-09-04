@@ -22,10 +22,7 @@ logger = init_logger(__name__)
 class StreamingAudioResampler:
     """Stateful polyphase resampler for streaming mono float audio.
 
-    The filter matches the default Kaiser-windowed sinc filter used by
-    ``scipy.signal.resample_poly``. Only samples with complete right-hand
-    filter support are emitted until ``final=True``, making the output
-    invariant to input chunk boundaries.
+    Retains filter state so output is invariant to input chunk boundaries.
     """
 
     _half_filter_width = 10
@@ -33,10 +30,8 @@ class StreamingAudioResampler:
     _max_polyphase_factor = 2_048
 
     def __init__(self, source_rate: int, target_rate: int):
-        if isinstance(source_rate, bool) or not isinstance(source_rate, int) or source_rate <= 0:
-            raise ValueError("source_rate must be a positive integer")
-        if isinstance(target_rate, bool) or not isinstance(target_rate, int) or target_rate <= 0:
-            raise ValueError("target_rate must be a positive integer")
+        if source_rate <= 0 or target_rate <= 0:
+            raise ValueError("Audio sample rates must be positive")
         self.source_rate = source_rate
         self.target_rate = target_rate
         rate_gcd = math.gcd(source_rate, target_rate)
@@ -70,13 +65,9 @@ class StreamingAudioResampler:
         return half_len, kernels
 
     @property
-    def pending_samples(self) -> int:
-        total_output_samples = self._ceil_div(self._input_samples * self._up, self._down)
-        return max(0, total_output_samples - self._output_samples)
-
-    @property
     def scratch_bytes(self) -> int:
-        return self.pending_samples * np.dtype(np.float32).itemsize
+        pending_samples = self._ceil_div(self._input_samples * self._up, self._down) - self._output_samples
+        return max(0, pending_samples) * np.dtype(np.float32).itemsize
 
     @staticmethod
     def _ceil_div(numerator: int, denominator: int) -> int:

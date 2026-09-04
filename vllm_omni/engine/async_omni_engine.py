@@ -227,10 +227,9 @@ class AsyncOmniEngine:
         # Stage resolution normalizes explicit, bare-name, and auto-discovered
         # deploy configs to the path that was actually selected. Reuse that
         # path for pipeline-wide session settings as well.
-        runtime_config_path = self.config_path
         self.duplex_session_config = DuplexSessionRuntimeConfig()
-        if runtime_config_path is not None:
-            self.duplex_session_config = load_deploy_config(runtime_config_path).duplex_session
+        if self.config_path is not None:
+            self.duplex_session_config = load_deploy_config(self.config_path).duplex_session
 
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None

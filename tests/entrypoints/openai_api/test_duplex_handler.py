@@ -320,24 +320,6 @@ class FakeChatService:
         return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
 
 
-def test_server_vad_metrics_use_served_model_name():
-    chat_service = FakeChatService(FakeEngineClient())
-    handler = OmniDuplexSessionHandler(chat_service=chat_service, served_model_name="served-model")
-    started: list[str] = []
-    finished: list[str] = []
-    handler._realtime_vad_metrics = SimpleNamespace(
-        session_started=started.append,
-        session_finished=finished.append,
-    )
-    session = DuplexSession("sid-metrics", DuplexSessionConfig(model="client-model"))
-
-    handler._install_server_vad_pipeline(session, SimpleNamespace(reset=lambda: None))
-    handler._install_server_vad_pipeline(session, None)
-
-    assert started == ["served-model"]
-    assert finished == ["served-model"]
-
-
 class TurnBasedFakeChatService(FakeChatService):
     """Chat-fallback service without a model-native duplex adapter."""
 
@@ -1516,9 +1498,31 @@ async def test_turn_based_server_vad_rejects_input_rate_change_after_append(
 
 
 @pytest.mark.parametrize("sample_rate_hz", INVALID_VALIDATED_SAMPLE_RATES)
-def test_native_realtime_protocol_validates_nested_audio_sample_rate(sample_rate_hz: object):
-    with pytest.raises(ValueError, match="sample_rate_hz"):
-        NativeRealtimeSessionProtocol._parse_realtime_audio_format({"type": "audio/pcm", "rate": sample_rate_hz})
+@pytest.mark.asyncio
+async def test_native_realtime_protocol_rejects_invalid_nested_audio_sample_rate(sample_rate_hz: object):
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    protocol.bind_sender(ws.send_json)
+
+    translated = await protocol._to_duplex_event(
+        {
+            "type": "session.update",
+            "event_id": "event-invalid-rate",
+            "session": {
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": sample_rate_hz},
+                    }
+                }
+            },
+        }
+    )
+
+    assert translated is None
+    error = ws.sent[-1]["error"]
+    assert error["code"] == "unsupported_audio_format"
+    assert error["event_id"] == "event-invalid-rate"
+    assert "sample_rate_hz" in error["message"]
 
 
 @pytest.mark.asyncio

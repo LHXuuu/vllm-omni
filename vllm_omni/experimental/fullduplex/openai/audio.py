@@ -23,8 +23,12 @@ MIN_INPUT_SAMPLE_RATE_HZ = 8_000
 MAX_INPUT_SAMPLE_RATE_HZ = 192_000
 
 
-def validate_input_sample_rate_hz(sample_rate_hz: int | float) -> int:
-    if isinstance(sample_rate_hz, bool) or (isinstance(sample_rate_hz, float) and not math.isfinite(sample_rate_hz)):
+def validate_input_sample_rate_hz(sample_rate_hz: object) -> int:
+    if (
+        isinstance(sample_rate_hz, bool)
+        or not isinstance(sample_rate_hz, int | float)
+        or not math.isfinite(sample_rate_hz)
+    ):
         raise ValueError("sample_rate_hz must be a finite integer")
     rate = int(sample_rate_hz)
     if rate != sample_rate_hz:

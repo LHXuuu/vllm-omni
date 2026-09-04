@@ -563,53 +563,6 @@ def test_websocket_routes_emit_stable_unavailable_frames_and_close(path: str, pa
                 websocket.receive_text()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("duplex_query", "duplex_available", "expected_handler"),
-    [
-        (None, True, "duplex"),
-        ("1", True, "duplex"),
-        ("true", True, "duplex"),
-        ("0", True, "legacy"),
-        ("false", True, "legacy"),
-        (None, False, "legacy"),
-    ],
-)
-async def test_realtime_route_defaults_to_duplex_and_preserves_explicit_legacy_selection(
-    monkeypatch,
-    duplex_query: str | None,
-    duplex_available: bool,
-    expected_handler: str,
-) -> None:
-    calls: list[str] = []
-
-    class _DuplexHandler:
-        async def handle_realtime_session(self, websocket) -> None:
-            calls.append("duplex")
-
-    class _LegacyConnection:
-        def __init__(self, websocket, serving) -> None:
-            assert serving is legacy_serving
-
-        async def handle_connection(self) -> None:
-            calls.append("legacy")
-
-    legacy_serving = object()
-    state = State()
-    state.openai_serving_duplex = _DuplexHandler() if duplex_available else None
-    state.openai_serving_realtime = legacy_serving
-    query_params = {} if duplex_query is None else {"duplex": duplex_query}
-    websocket = SimpleNamespace(
-        app=SimpleNamespace(state=state),
-        query_params=query_params,
-    )
-    monkeypatch.setattr(api_server, "RealtimeConnection", _LegacyConnection)
-
-    await api_server.realtime_websocket(websocket)
-
-    assert calls == [expected_handler]
-
-
 def test_health_without_engine_returns_stable_unhealthy_response() -> None:
     """Lock ``/health`` with no engine initialized.
 

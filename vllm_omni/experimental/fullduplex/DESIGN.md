@@ -58,7 +58,8 @@ The checkpoint keeps these verified contracts:
 - scheduler data-plane append over a resumable request;
 - stale epoch/turn/response fencing;
 - `/v1/duplex` and OpenAI Realtime projection;
-- optional OpenAI `server_vad` turn detection backed by per-session Silero VAD;
+- optional OpenAI `server_vad` turn detection backed by a process-shared Silero
+  model and per-session VAD state;
 - existing JoyVL behavior.
 
 The checkpoint does not claim:
@@ -511,10 +512,9 @@ MiniCPM-specific bridge-state key.
 The stable API server inspects the deployment `session_mode` before importing or
 constructing the experimental duplex handler. Ordinary deployments do not load
 the full-duplex serving package or create its registries and background state.
-For an enabled deployment, bare `/v1/realtime` selects the Realtime duplex
-stack. `?duplex=1` remains a compatibility alias, while an explicit false value
-selects the legacy handler. Model-name matching is not used for routing or
-native-runtime activation. MiniCPM clients explicitly
+For an enabled deployment, the client still selects the Realtime duplex route
+with `?duplex=1` (or an equivalent explicit true value). Model-name matching is
+not used for routing or native-runtime activation. MiniCPM clients explicitly
 set `extra_body.minicpmo45_native_duplex=true`; repository demos do so in their
 session payloads.
 
@@ -548,8 +548,7 @@ own response IDs, playback, overlap, Realtime events, or model policy.
 
 ### Normative Realtime event contract
 
-The public contract in this section applies to `/v1/realtime`; `?duplex=1`
-remains an equivalent compatibility alias. Internal
+The public contract in this section applies to `/v1/realtime?duplex=1`. Internal
 duplex event names such as `response.output_audio.delta` are projection inputs,
 not additional public aliases. Events for one attachment preserve mailbox
 order; replay after resume preserves the original event order and `event_id`.
@@ -642,8 +641,7 @@ multi-turn runtime evidence.
 
 During auto-response overlap, `preserve_realtime_input` distinguishes "do not
 append this silent chunk to the native buffer" from "clear the open Realtime
-item". Silent overlap no longer discards earlier user PCM. A separate explicit
-`server_vad` policy is documented in the Realtime contract above.
+item". Silent overlap no longer discards earlier user PCM.
 
 The first chunk of one overlapping input item also reserves its target model
 turn. A later Realtime commit uses that reserved identity even if response EOS

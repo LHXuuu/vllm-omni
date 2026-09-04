@@ -212,8 +212,6 @@ AUDIO_CONTINUITY_LABELS = ("model_name", "stage", "replica", "threshold_ms")
 # path (e.g. code2wav rejecting malformed codec input) can be distinguished
 # from other "200 OK + empty audio" cases.
 AUDIO_SKIPPED_LABELS = ("model_name", "stage", "replica", "reason")
-REALTIME_VAD_LABELS = ("model_name",)
-REALTIME_VAD_ERROR_LABELS = ("model_name", "reason")
 
 # Cross-stage transfer label set. Each observation is one physical hop from
 # (from_stage, from_replica) to (to_stage, to_replica).

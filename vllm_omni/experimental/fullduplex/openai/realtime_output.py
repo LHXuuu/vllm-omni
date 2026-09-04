@@ -213,10 +213,7 @@ class RealtimeOutputProjector:
                 ),
             ]
         if event_type == "input.committed":
-            self._input_speech_started = False
-            self._active_input_item_id = None
-            self._input_audio_buffer_has_audio = False
-            self._input_audio_buffer_had_non_speech = False
+            self._reset_realtime_input_buffer_state()
             event_item_id = event.get("item_id")
             item_id = (
                 event_item_id
@@ -320,12 +317,7 @@ class RealtimeOutputProjector:
                 if item.get("status") == "completed":
                     payloads.append(self._conversation_item_done_event(item))
                 return payloads
-            return [
-                self._realtime_error_payload(
-                    "invalid_conversation_item",
-                    "Conversation item payload is missing or invalid",
-                )
-            ]
+            return [{"type": "conversation.item.created", "item": item, "event": event}]
         if event_type == "conversation.item.deleted":
             item_id = event.get("item_id")
             if isinstance(item_id, str):

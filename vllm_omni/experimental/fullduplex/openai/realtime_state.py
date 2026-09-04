@@ -25,6 +25,14 @@ REALTIME_PCM_DEFAULT_SAMPLE_RATE_HZ = 24_000
 REALTIME_PCM_F32_DEFAULT_SAMPLE_RATE_HZ = 16_000
 REALTIME_G711_DEFAULT_SAMPLE_RATE_HZ = 8_000
 
+_RealtimeProtocolConfig = tuple[str, int, str, int | None, float]
+_PendingTurnDetectionUpdate = tuple[
+    bool,
+    dict[str, object] | None,
+    asyncio.Event,
+    _RealtimeProtocolConfig,
+]
+
 
 def realtime_default_sample_rate_hz(fmt: object) -> int | None:
     if not isinstance(fmt, str):
@@ -131,16 +139,7 @@ class RealtimeSessionState:
     _output_audio_format: str = "pcm16"
     _overlap_silence_rms: float = 0.003
     _turn_detection: dict[str, object] | None = None
-    _pending_turn_detection_update: (
-        tuple[
-            bool,
-            bool,
-            dict[str, object] | None,
-            asyncio.Event,
-            tuple[str, int, str, int | None, float],
-        ]
-        | None
-    ) = None
+    _pending_turn_detection_update: _PendingTurnDetectionUpdate | None = None
     _send_realtime_json: Any = None
     _initial_session_update: bool = False
     _input_speech_started: bool = False
@@ -218,16 +217,7 @@ class RealtimeStateOwner:
     _output_audio_format: str = _RealtimeStateField()
     _overlap_silence_rms: float = _RealtimeStateField()
     _turn_detection: dict[str, object] | None = _RealtimeStateField()
-    _pending_turn_detection_update: (
-        tuple[
-            bool,
-            bool,
-            dict[str, object] | None,
-            asyncio.Event,
-            tuple[str, int, str, int | None, float],
-        ]
-        | None
-    ) = _RealtimeStateField()
+    _pending_turn_detection_update: _PendingTurnDetectionUpdate | None = _RealtimeStateField()
     _send_realtime_json: Any = _RealtimeStateField()
     _initial_session_update: bool = _RealtimeStateField()
     _input_speech_started: bool = _RealtimeStateField()

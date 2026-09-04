@@ -341,18 +341,16 @@ class ServerVADPipeline:
         if self._source_sample_rate_hz is not None and source_sample_rate_hz != self._source_sample_rate_hz:
             raise ValueError("server_vad input sample rate cannot change within a continuous audio stream")
         if pcm16.size and self._source_sample_rate_hz is None:
-            input_resampler = (
+            self._input_resampler = (
                 None
                 if source_sample_rate_hz == self.sample_rate_hz
                 else StreamingAudioResampler(source_sample_rate_hz, self.sample_rate_hz)
             )
             self._source_sample_rate_hz = source_sample_rate_hz
-            self._input_resampler = input_resampler
 
+        normalized = np.ascontiguousarray(pcm16, dtype=np.float32) * np.float32(1.0 / 32768.0)
         if self._input_resampler is not None:
-            normalized = self._input_resampler.process(pcm16.astype(np.float32) * np.float32(1.0 / 32768.0))
-        else:
-            normalized = np.ascontiguousarray(pcm16, dtype=np.float32) / np.float32(32768.0)
+            normalized = self._input_resampler.process(normalized)
         return await self.push(normalized)
 
     async def push(self, samples: np.ndarray) -> ServerVADBatch:
@@ -391,14 +389,12 @@ class ServerVADPipeline:
             inference_ms=(time.perf_counter() - started_at) * 1000,
         )
 
-    def reset(self, *, clear_timeline: bool = False) -> None:
+    def reset(self) -> None:
         self._input_resampler = None
         self._source_sample_rate_hz = None
         self._scratch = np.empty(0, dtype=np.float32)
         self._detector_state = self.backend.new_state()
         self.endpoint_policy.reset()
-        if clear_timeline:
-            self._processed_samples = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,20 +479,8 @@ class SileroVADBackend:
 class SileroVADBackendProvider:
     """Resolve, verify, and load one Silero model instance per process."""
 
-    def __init__(
-        self,
-        *,
-        model_path: str | None = None,
-        repo_id: str = SILERO_VAD_REPO_ID,
-        revision: str = SILERO_VAD_REVISION,
-        filename: str = SILERO_VAD_FILENAME,
-        sha256: str = SILERO_VAD_SHA256,
-    ) -> None:
+    def __init__(self, *, model_path: str | None = None) -> None:
         self.model_path = model_path
-        self.repo_id = repo_id
-        self.revision = revision
-        self.filename = filename
-        self.sha256 = sha256
         self._backend: SileroVADBackend | None = None
         self._lock = threading.Lock()
 
@@ -517,9 +501,9 @@ class SileroVADBackendProvider:
                 return path
             raise RuntimeError(f"Configured Silero VAD model does not exist: {path}")
         cached = try_get_local_file(
-            model=self.repo_id,
-            file_name=self.filename,
-            revision=self.revision,
+            model=SILERO_VAD_REPO_ID,
+            file_name=SILERO_VAD_FILENAME,
+            revision=SILERO_VAD_REVISION,
         )
         if isinstance(cached, Path) and cached.is_file():
             return cached
@@ -530,5 +514,5 @@ class SileroVADBackendProvider:
 
     def _verify_checksum(self, path: Path) -> None:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if digest != self.sha256:
-            raise RuntimeError(f"Silero VAD checksum mismatch for {path}: expected {self.sha256}, got {digest}")
+        if digest != SILERO_VAD_SHA256:
+            raise RuntimeError(f"Silero VAD checksum mismatch for {path}: expected {SILERO_VAD_SHA256}, got {digest}")
