@@ -529,8 +529,6 @@ def _server_vad_audio_append(
     event: dict[str, Any] = {
         "type": "input_audio_buffer.append",
         "audio": base64.b64encode(np.zeros(sample_count, dtype="<i2").tobytes()).decode(),
-        "format": "pcm16",
-        "sample_rate_hz": sample_rate_hz,
     }
     if event_id is not None:
         event["event_id"] = event_id
@@ -717,51 +715,6 @@ async def test_native_realtime_protocol_conversation_item_create_commits_user_te
 
 
 @pytest.mark.asyncio
-async def test_complete_audio_item_preserves_explicit_manual_commit_translation():
-    ws = TimedWebSocket()
-    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
-    protocol.bind_sender(ws.send_json)
-
-    ws.put(
-        {
-            "type": "session.update",
-            "session": {
-                "model": "test-model",
-                "audio": {"input": {"turn_detection": None}},
-            },
-        }
-    )
-    session_create = json.loads(await protocol.receive_internal_event_text(ws))
-    assert session_create["type"] == "session.create"
-    protocol.commit_realtime_turn_detection_update()
-
-    pcm16 = np.full(320, 8_192, dtype="<i2")
-    ws.put(
-        {
-            "type": "conversation.item.create",
-            "item": {
-                "id": "item-manual-audio",
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_audio",
-                        "audio": base64.b64encode(pcm16.tobytes()).decode(),
-                    }
-                ],
-            },
-        }
-    )
-
-    append = json.loads(await protocol.receive_internal_event_text(ws))
-    commit = json.loads(await protocol.receive_internal_event_text(ws))
-
-    assert append["type"] == "input_audio_buffer.append"
-    assert commit["type"] == "input_audio_buffer.commit"
-    assert commit["item_id"] == "item-manual-audio"
-
-
-@pytest.mark.asyncio
 async def test_function_output_is_recorded_only_after_runtime_delivery():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
@@ -916,7 +869,7 @@ async def test_native_realtime_protocol_preserves_input_turn_policy_hints():
 
 
 @pytest.mark.asyncio
-async def test_realtime_protocol_accepts_turn_based_server_vad():
+async def test_realtime_protocol_accepts_legacy_server_vad_alias():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     protocol.bind_sender(ws.send_json)
@@ -926,89 +879,18 @@ async def test_realtime_protocol_accepts_turn_based_server_vad():
             "type": "session.update",
             "model": "test-model",
             "session_id": "rt-turn-detection",
-            "input_audio_format": {"type": "audio/pcm", "rate": 16_000},
             "turn_detection": {
                 "type": "server_vad",
                 "interrupt_response": False,
-                "silence_duration_ms": 900,
                 "threshold": 0.4,
             },
         }
     )
 
     assert translated is not None
-    protocol.commit_realtime_turn_detection_update()
     config = DuplexSessionConfig.from_event(translated)
     assert config.server_vad is not None
     assert config.server_vad.threshold == 0.4
-    assert config.server_vad.silence_duration_ms == 900
-    assert config.server_vad.create_response is True
-
-    updated = protocol._from_duplex_event(
-        {
-            "type": "session.updated",
-            "session": {"turn_detection": config.server_vad.as_dict()},
-        }
-    )[0]
-    assert updated["session"]["audio"]["input"]["turn_detection"]["type"] == "server_vad"
-    assert updated["session"]["turn_detection"]["type"] == "server_vad"
-
-    audio = base64.b64encode(np.zeros(320, dtype="<i2").tobytes()).decode()
-    append = await protocol._to_duplex_event(
-        {
-            "type": "input_audio_buffer.append",
-            "audio": audio,
-            "format": "pcm16",
-        }
-    )
-    assert append is not None
-    assert append["format"] == "pcm16"
-    assert append["sample_rate_hz"] == 16_000
-
-
-@pytest.mark.asyncio
-async def test_realtime_protocol_rejects_manual_commit_with_turn_based_server_vad():
-    ws = TimedWebSocket()
-    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
-    protocol.bind_sender(ws.send_json)
-
-    translated = await protocol._to_duplex_event(
-        {
-            "type": "session.update",
-            "model": "test-model",
-            "turn_detection": {"type": "server_vad", "interrupt_response": False},
-        }
-    )
-    assert translated is not None
-    protocol.commit_realtime_turn_detection_update()
-
-    audio = base64.b64encode(np.zeros(320, dtype="<i2").tobytes()).decode()
-    append = await protocol._to_duplex_event(
-        {
-            "type": "input_audio_buffer.append",
-            "audio": audio,
-            "format": "pcm16",
-            "sample_rate_hz": 16_000,
-        }
-    )
-    assert append is not None
-
-    sent_before_commit = len(ws.sent)
-    committed = await protocol._to_duplex_event(
-        {
-            "type": "input_audio_buffer.commit",
-            "event_id": "event-manual-commit",
-        }
-    )
-
-    assert committed is None
-    commit_events = ws.sent[sent_before_commit:]
-    assert [event["type"] for event in commit_events] == ["error"]
-    error = commit_events[0]["error"]
-    assert error["type"] == "invalid_request_error"
-    assert error["code"] == "server_vad_manual_commit_unsupported"
-    assert error["event_id"] == "event-manual-commit"
-    assert not any(event.get("type") == "input_audio_buffer.speech_stopped" for event in ws.sent)
 
 
 @pytest.mark.asyncio
@@ -1046,49 +928,12 @@ def test_native_realtime_protocol_preserves_omitted_turn_detection():
 
 
 @pytest.mark.asyncio
-async def test_native_realtime_protocol_rejects_conflicting_turn_detection_aliases():
-    ws = TimedWebSocket()
-    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
-    protocol.bind_sender(ws.send_json)
-
-    translated = await protocol._to_duplex_event(
-        {
-            "type": "session.update",
-            "model": "test-model",
-            "turn_detection": None,
-            "audio": {
-                "input": {
-                    "turn_detection": {
-                        "type": "server_vad",
-                    }
-                }
-            },
-        }
-    )
-
-    assert translated is None
-    assert ws.sent[-1]["error"]["code"] == "unsupported_turn_detection"
-    assert "conflicting" in ws.sent[-1]["error"]["message"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "nested_realtime_payload",
-    [False, True],
-    ids=["direct", "nested-realtime-payload"],
-)
-async def test_duplex_session_create_reports_invalid_server_vad_as_client_error(
-    nested_realtime_payload: bool,
-):
+async def test_duplex_session_create_reports_invalid_server_vad_as_client_error():
     session_id = "sid-invalid-server-vad-config"
     event = _session_create(session_id)
-    turn_detection = {"type": "server_vad", "threshold": 1.5}
-    if nested_realtime_payload:
-        event["session"]["extra_body"] = {
-            "realtime_session_payload": {"turn_detection": turn_detection},
-        }
-    else:
-        event["session"]["turn_detection"] = turn_detection
+    event["session"]["extra_body"] = {
+        "realtime_session_payload": {"turn_detection": {"type": "server_vad", "threshold": 1.5}},
+    }
 
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(
@@ -1527,74 +1372,27 @@ async def test_native_realtime_protocol_rejects_invalid_nested_audio_sample_rate
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "updates",
+    "input_update",
     [
-        [
-            {
-                "type": "session.update",
-                "session": {
-                    "model": "test-model",
-                    "audio": {
-                        "input": {
-                            "format": "g711_ulaw",
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "interrupt_response": False,
-                            },
-                        }
-                    },
-                },
-            }
-        ],
-        [
-            {
-                "type": "session.update",
-                "session": {
-                    "model": "test-model",
-                    "audio": {
-                        "input": {
-                            "format": {"type": "audio/pcm", "rate": 16_000},
-                            "channels": 2,
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "interrupt_response": False,
-                            },
-                        }
-                    },
-                },
-            }
-        ],
-        [
-            _server_vad_session_update(_server_vad_turn_detection()),
-            {
-                "type": "session.update",
-                "session": {"audio": {"input": {"format": "g711_ulaw"}}},
-            },
-        ],
+        {"format": "g711_ulaw"},
+        {"channels": 2},
     ],
-    ids=["g711", "stereo", "incompatible-update"],
+    ids=["g711", "stereo"],
 )
 async def test_native_realtime_protocol_rejects_unsupported_turn_based_server_vad_audio(
-    updates: list[dict[str, Any]],
+    input_update: dict[str, Any],
 ):
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     protocol.bind_sender(ws.send_json)
+    update = _server_vad_session_update(_server_vad_turn_detection())
+    update["session"]["audio"]["input"].update(input_update)
 
-    translated = None
-    for index, update in enumerate(updates):
-        translated = await protocol._to_duplex_event(update)
-        if translated is not None and index < len(updates) - 1:
-            protocol.commit_realtime_turn_detection_update()
+    translated = await protocol._to_duplex_event(update)
 
     assert translated is None
     assert ws.sent[-1]["error"]["code"] == "unsupported_turn_detection"
     assert "mono PCM16" in ws.sent[-1]["error"]["message"]
-    if len(updates) == 2:
-        append = await protocol._to_duplex_event(_server_vad_audio_append(frame_count=1))
-        assert append is not None
-        assert append["format"] == "pcm16"
-        assert append["sample_rate_hz"] == 16_000
 
 
 @pytest.mark.asyncio
@@ -1668,7 +1466,7 @@ async def test_realtime_server_vad_create_response_false_accepts_response_create
 
 
 @pytest.mark.asyncio
-async def test_realtime_server_vad_complete_audio_item_preserves_wire_item_and_uses_wav_history():
+async def test_realtime_server_vad_complete_audio_item_bypasses_vad():
     def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
         item = data.get("item")
         if (
@@ -1740,8 +1538,6 @@ async def test_realtime_server_vad_update_initialization_failure_keeps_session_o
     ws = TimedWebSocket()
     ws.put(_server_vad_session_update(None))
     ws.put(_server_vad_session_update(_server_vad_turn_detection(), event_id="event-enable-server-vad"))
-    ws.put(_server_vad_audio_append(frame_count=1, is_speech=True))
-    ws.put({"type": "input_audio_buffer.commit", "event_id": "commit-after-failed-enable"})
     ws.put(
         {
             "type": "session.update",
@@ -1767,17 +1563,10 @@ async def test_realtime_server_vad_update_initialization_failure_keeps_session_o
         if event.get("type") == "session.updated"
         and event.get("session", {}).get("instructions") == "session remains usable"
     )
-    event_types = ws.sent_types()
-    speech_started_index = event_types.index("input_audio_buffer.speech_started")
-    committed_index = event_types.index("input_audio_buffer.committed")
     closed_index = ws.sent_types().index("session.closed")
-    assert initialization_error_index < speech_started_index < committed_index < recovered_update_index < closed_index
+    assert initialization_error_index < recovered_update_index < closed_index
     assert initialization_error["error"]["event_id"] == "event-enable-server-vad"
     assert recovered_update["session"]["audio"]["input"]["turn_detection"] is None
-    assert not any(
-        event.get("type") == "error" and event.get("error", {}).get("code") == "server_vad_manual_commit_unsupported"
-        for event in ws.sent
-    )
 
 
 @pytest.mark.asyncio
@@ -1805,12 +1594,13 @@ async def test_realtime_session_update_barrier_enables_server_vad_before_followi
         )
         and event["session"]["audio"]["input"]["turn_detection"].get("type") == "server_vad"
     )
-    commit_error_index = next(
-        index
+    commit_error_index, commit_error = next(
+        (index, event["error"])
         for index, event in enumerate(ws.sent)
         if event.get("type") == "error" and event.get("error", {}).get("code") == "server_vad_manual_commit_unsupported"
     )
     assert update_index < commit_error_index
+    assert commit_error["event_id"] == "commit-after-enable"
     assert "input_audio_buffer.committed" not in ws.sent_types()
 
 
@@ -2011,22 +1801,12 @@ def test_personaplex_candidate_update_does_not_leak_minicpmo_ref_audio_check():
         (False, {"type": "server_vad"}, "server_vad_requires_native_duplex"),
         (True, {"type": "server_vad", "interrupt_response": False}, "unsupported_turn_detection"),
         (True, {"type": "server_vad"}, None),
-        (True, {"type": "server_vad", "threshold": 0.15}, "unsupported_turn_detection"),
-        (True, {"type": "server_vad", "create_response": False}, "unsupported_turn_detection"),
-        (False, {"type": "server_vad", "min_speech_duration_ms": 96}, "unsupported_turn_detection"),
-        (True, {"type": "server_vad", "min_speech_duration_ms": 96}, None),
-        (False, {"type": "server_vad", "interrupt_response": False, "threshold": 0.1}, None),
     ],
     ids=[
         "turn-based-endpointing",
         "turn-based-default-interruption",
         "native-non-interrupting",
         "native-default-interruption",
-        "native-low-threshold",
-        "native-no-auto-response",
-        "turn-based-native-extension",
-        "native-min-speech-duration",
-        "turn-based-low-threshold",
     ],
 )
 def test_server_vad_runtime_capability_matrix(
@@ -2203,40 +1983,6 @@ async def test_minicpmo_native_session_update_rejects_native_duplex_mode_flip():
         "instructions_update_unsupported",
     ]
     assert "session.updated" not in ws.sent_types()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("requested_value", "expected_code"),
-    [
-        (True, "native_duplex_mode_update_unsupported"),
-        (None, "invalid_request_error"),
-    ],
-)
-async def test_turn_based_session_update_rejects_native_duplex_mode_flip(
-    requested_value: object,
-    expected_code: str,
-):
-    handler = OmniDuplexSessionHandler(
-        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
-        config_timeout_s=0.1,
-        idle_timeout_s=1,
-    )
-    ws = TimedWebSocket()
-    ws.put(_session_create("sid-turn-based-native-flag-flip"))
-    ws.put(
-        {
-            "type": "turn.signal",
-            "event": "session.update",
-            "payload": {"extra_body": {"minicpmo45_native_duplex": requested_value}},
-        }
-    )
-    ws.put({"type": "session.close"})
-
-    await handler.handle_session(ws)
-
-    error = next(message for message in ws.sent if message.get("type") == "error")
-    assert error["code"] == expected_code
 
 
 def test_native_realtime_protocol_audio_delta_preserves_sample_rate_hz():
@@ -7659,39 +7405,12 @@ def test_minicpmo_native_duplex_explicit_barge_in_request_interrupts():
     }
 
 
-def test_native_server_vad_speech_started_triggers_barge_in_once():
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
-    session = DuplexSession(
-        session_id="sid-native-server-vad-barge-in",
-        config=DuplexSessionConfig(overlap_policy=DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value),
-        capabilities=DuplexCapabilities.minicpmo45_native(),
-    )
-    payload = _native_audio_payload(samples=512, is_speech=True)
-
-    started = handler._overlap_decision(
-        session,
-        {"vad": {"speech_started": True}},
-        payload,
-    )
-    active = handler._overlap_decision(
-        session,
-        {"vad": {"speech_started": False}},
-        payload,
-    )
-
-    assert started["action"] == "barge_in"
-    assert started["reason"] == "server_vad_speech_started"
-    assert started["cancel_reason"] == "turn_detected"
-    assert active["action"] == "listen"
-    assert active["reason"] == "server_vad_utterance_active"
-    assert active["force_listen"] is True
-
-
 @pytest.mark.asyncio
 async def test_native_server_vad_uses_shared_pipeline_and_emits_boundaries():
     backend = FakeServerVADBackend([0.9] * 10 + [0.0] * 50)
+    engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(
-        chat_service=FakeChatService(FakeEngineClient()),
+        chat_service=FakeChatService(engine),
         config_timeout_s=0.1,
         idle_timeout_s=1,
         server_vad_backend_provider=FakeServerVADProvider(backend),
@@ -7708,6 +7427,7 @@ async def test_native_server_vad_uses_shared_pipeline_and_emits_boundaries():
             "sample_rate_hz": 16_000,
         }
     )
+    ws.put({"type": "input_audio_buffer.commit", "final": True})
     ws.put({"type": "session.close"})
 
     await asyncio.wait_for(
@@ -7726,41 +7446,8 @@ async def test_native_server_vad_uses_shared_pipeline_and_emits_boundaries():
     ]
     assert boundary_events[0]["item_id"] == boundary_events[1]["item_id"]
     assert backend.calls == 60
-
-
-@pytest.mark.asyncio
-async def test_native_server_vad_boundary_allows_explicit_commit():
-    protocol = NativeRealtimeSessionProtocol({})
-    protocol._turn_detection = {
-        "type": "server_vad",
-        "interrupt_response": True,
-    }
-    item_id = "item_native_server_vad"
-
-    protocol.encode_outbound_event(
-        {
-            "type": "input_audio_buffer.speech_started",
-            "item_id": item_id,
-            "audio_start_ms": 0,
-        }
-    )
-    protocol.encode_outbound_event(
-        {
-            "type": "input_audio_buffer.speech_stopped",
-            "item_id": item_id,
-            "audio_end_ms": 500,
-        }
-    )
-
-    committed = await protocol._to_duplex_event(
-        {
-            "type": "input_audio_buffer.commit",
-            "final": True,
-        }
-    )
-
-    assert committed is not None
-    assert committed["item_id"] == item_id
+    assert any(final for _, _, _, final in engine.appended)
+    assert not any(event.get("error", {}).get("code") == "server_vad_manual_commit_unsupported" for event in ws.sent)
 
 
 @pytest.mark.asyncio

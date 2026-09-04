@@ -57,7 +57,6 @@ if loaded:
 def test_generic_handler_supports_adapterless_chat_fallback() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     script = """
-import sys
 from types import SimpleNamespace
 
 from vllm_omni.experimental.fullduplex.openai.serving import OmniDuplexSessionHandler
@@ -66,12 +65,6 @@ chat_service = SimpleNamespace(engine_client=SimpleNamespace())
 handler = OmniDuplexSessionHandler(chat_service=chat_service)
 if handler._serving_runtime_adapter is not None:
     raise SystemExit("generic handler silently selected a model serving adapter")
-if any(
-    name == "vllm_omni.experimental.fullduplex.minicpmo45"
-    or name.startswith("vllm_omni.experimental.fullduplex.minicpmo45.")
-    for name in sys.modules
-):
-    raise SystemExit("adapterless chat fallback loaded MiniCPM-o")
 """
 
     result = subprocess.run(

@@ -4,10 +4,10 @@
 E2E online tests for Qwen3-Omni /v1/realtime WebSocket (streaming PCM in, audio out).
 
 Four scenarios:
+- Ready CI: async_chunk on, smoke only (no send delay, no accuracy check).
 - Merge CI: async_chunk on + send delay, full accuracy check.
-- Merge CI: async_chunk on, long-response regression coverage.
 - Merge CI: async_chunk off, no send delay, full accuracy check.
-- Merge CI: server VAD, two turns without client commits.
+- Server VAD: two turns without client commits.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from tests.helpers.media import (
     generate_synthetic_audio,
 )
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.experimental.fullduplex.openai.server_vad import (
     SILERO_VAD_FILENAME,
     SILERO_VAD_REPO_ID,
@@ -54,6 +54,7 @@ SEND_DELAY_MS = 200
 
 # CI overlay bakes in async_chunk: False and covers CUDA/ROCm/XPU via ``platforms:``.
 default_stage_config = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
+server_vad_stage_config = modify_stage_config(default_stage_config, {"session_mode": "duplex"})
 
 realtime_sync_server_params = [
     pytest.param(
@@ -75,6 +76,17 @@ realtime_async_chunk_server_params = [
             server_args=["--async-chunk"],
         ),
         id="async_chunk",
+    ),
+]
+
+realtime_server_vad_server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=server_vad_stage_config,
+            use_stage_cli=True,
+        ),
+        id="server_vad",
     ),
 ]
 
@@ -112,7 +124,7 @@ async def _run_realtime_audio_roundtrip(
     send_delay_ms: int = 0,
     completion_timeout_s: float = 600,
 ) -> dict:
-    uri = f"ws://{host}:{port}/v1/realtime?duplex=0"
+    uri = f"ws://{host}:{port}/v1/realtime"
     incremental: list[bytes] = []
     output_sr = 24000
     text_chunks: list[str] = []
@@ -227,7 +239,7 @@ async def _run_server_vad_audio_roundtrips(
     chunk_bytes = max(16_000 * 2 // 1000 * chunk_ms, 2)
     turn_events: list[list[dict]] = []
 
-    async with websockets.connect(f"ws://{host}:{port}/v1/realtime", max_size=64 * 1024 * 1024) as ws:
+    async with websockets.connect(f"ws://{host}:{port}/v1/realtime?duplex=1", max_size=64 * 1024 * 1024) as ws:
         await ws.send(
             json.dumps(
                 {
@@ -387,7 +399,7 @@ class TestQwen3OmniRealtimeWebSocket:
     @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-    @pytest.mark.parametrize("omni_server", realtime_sync_server_params, indirect=True)
+    @pytest.mark.parametrize("omni_server", realtime_server_vad_server_params, indirect=True)
     def test_server_vad_multi_turn_without_client_commit(
         self,
         cached_silero_vad_artifact: str,

@@ -243,23 +243,16 @@ def test_silero_backend_matches_upstream_v62_streaming_contract(monkeypatch, tmp
         inter_op_num_threads = 0
         intra_op_num_threads = 0
 
-    class FakeInput:
-        def __init__(self, name: str) -> None:
-            self.name = name
-
     class FakeInferenceSession:
-        instances: list[FakeInferenceSession] = []
-
         def __init__(self, path: str, *, providers: list[str], sess_options: object) -> None:
-            self.path = path
             self.providers = providers
             self.sess_options = sess_options
             self.calls: list[dict[str, np.ndarray]] = []
             self.run_barrier: threading.Barrier | None = None
-            self.instances.append(self)
+            sessions.append(self)
 
-        def get_inputs(self) -> list[FakeInput]:
-            return [FakeInput("input"), FakeInput("state"), FakeInput("sr")]
+        def get_inputs(self) -> list[SimpleNamespace]:
+            return [SimpleNamespace(name=name) for name in ("input", "state", "sr")]
 
         def run(self, _outputs: object, inputs: dict[str, np.ndarray]) -> list[np.ndarray]:
             self.calls.append({name: np.array(value, copy=True) for name, value in inputs.items()})
@@ -270,16 +263,20 @@ def test_silero_backend_matches_upstream_v62_streaming_contract(monkeypatch, tmp
                 np.full((2, 1, 128), len(self.calls), dtype=np.float32),
             ]
 
-    fake_ort = SimpleNamespace(
-        SessionOptions=FakeSessionOptions,
-        InferenceSession=FakeInferenceSession,
+    sessions: list[FakeInferenceSession] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "onnxruntime",
+        SimpleNamespace(
+            SessionOptions=FakeSessionOptions,
+            InferenceSession=FakeInferenceSession,
+        ),
     )
-    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
 
     model_path = tmp_path / "silero_vad.onnx"
     model_path.write_bytes(b"fake-model")
     backend = SileroVADBackend(model_path)
-    session = FakeInferenceSession.instances[0]
+    session = sessions[0]
 
     assert session.providers == ["CPUExecutionProvider"]
     assert session.sess_options.inter_op_num_threads == 1

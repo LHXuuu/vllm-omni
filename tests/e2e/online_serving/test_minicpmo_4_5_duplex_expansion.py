@@ -11,7 +11,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from huggingface_hub import hf_hub_download
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     SERVER_PARAMS,
@@ -40,9 +39,11 @@ from vllm_omni.experimental.fullduplex.openai.server_vad import (
 pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(scope="module")
 def _cached_server_vad_artifact() -> None:
     """Cache the pinned ONNX artifact before the Realtime server starts."""
+    from huggingface_hub import hf_hub_download
+
     hf_hub_download(
         repo_id=SILERO_VAD_REPO_ID,
         filename=SILERO_VAD_FILENAME,
@@ -113,7 +114,7 @@ def test_duplex_soft_interrupt(omni_server, tmp_path: Path) -> None:
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-def test_duplex_server_vad_hard_interrupt(omni_server) -> None:
+def test_duplex_server_vad_hard_interrupt(_cached_server_vad_artifact, omni_server) -> None:
     result = asyncio.run(
         run_server_vad_interrupt(
             SimpleNamespace(
