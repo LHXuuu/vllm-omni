@@ -11,8 +11,6 @@ import wave
 
 import numpy as np
 
-from vllm_omni.entrypoints.openai.audio_utils_mixin import StreamingAudioResampler
-
 try:
     from audioop import alaw2lin, lin2alaw, lin2ulaw, ulaw2lin
 except ImportError:  # pragma: no cover - audioop is removed in newer Python.
@@ -41,6 +39,10 @@ def validate_input_sample_rate_hz(sample_rate_hz: object) -> int:
 def resample_pcm16_mono(raw: bytes, *, source_rate_hz: int, target_rate_hz: int) -> bytes:
     if source_rate_hz <= 0 or target_rate_hz <= 0 or source_rate_hz == target_rate_hz:
         return raw
+    # Import lazily so the generic Duplex audio module does not pull in the
+    # OpenAI API server while the Duplex stack itself is being imported.
+    from vllm_omni.entrypoints.openai.audio_utils_mixin import StreamingAudioResampler
+
     samples = np.frombuffer(raw, dtype="<i2")
     rate_gcd = math.gcd(source_rate_hz, target_rate_hz)
     reduced_factor = max(source_rate_hz // rate_gcd, target_rate_hz // rate_gcd)

@@ -663,6 +663,9 @@ class DuplexSession:
         return active_turn_id is None or int(turn_id) == active_turn_id
 
     def append_history_message(self, message: dict[str, object]) -> None:
+        response_id = self.active_response_id
+        if response_id is not None:
+            self.reserve_history_item(f"item_{response_id}")
         self._conversation.messages.append(message)
 
     def stage_pending_history_item(self, item_id: str, message: dict[str, object]) -> None:

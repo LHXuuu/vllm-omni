@@ -10,12 +10,13 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import numpy as np
 from vllm.transformers_utils.repo_utils import try_get_local_file
 
-from vllm_omni.entrypoints.openai.audio_utils_mixin import StreamingAudioResampler
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.openai.audio_utils_mixin import StreamingAudioResampler
 
 SILERO_VAD_REPO_ID = "istupakov/silero-vad-onnx"
 SILERO_VAD_REVISION = "8b14476858ef240c50b3884bb38cc67290c1cc70"
@@ -341,6 +342,8 @@ class ServerVADPipeline:
         if self._source_sample_rate_hz is not None and source_sample_rate_hz != self._source_sample_rate_hz:
             raise ValueError("server_vad input sample rate cannot change within a continuous audio stream")
         if pcm16.size and self._source_sample_rate_hz is None:
+            from vllm_omni.entrypoints.openai.audio_utils_mixin import StreamingAudioResampler
+
             self._input_resampler = (
                 None
                 if source_sample_rate_hz == self.sample_rate_hz

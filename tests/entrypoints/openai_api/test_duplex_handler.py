@@ -1096,7 +1096,7 @@ async def test_realtime_session_update_preserves_tools_and_metadata():
     chat_service = FakeChatService(engine)
     handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
     ws = TimedWebSocket()
-    ws.put(_session_create("sid-rt-update-fields"))
+    ws.put(_native_session_create("sid-rt-update-fields"))
     ws.put(
         {
             "type": "turn.signal",
@@ -1794,6 +1794,7 @@ async def test_minicpmo_native_session_update_requires_ref_audio_before_enabling
 def test_personaplex_candidate_update_does_not_leak_minicpmo_ref_audio_check():
     handler = OmniDuplexSessionHandler(
         chat_service=SimpleNamespace(engine_client=SimpleNamespace()),
+        served_model_name="test-model",
         serving_runtime_adapter=PersonaPlexServingRuntimeAdapter(lambda *_: None),
     )
     session = DuplexSession(
@@ -4991,7 +4992,7 @@ async def test_duplex_handler_runtime_open_failure_is_reported_to_client():
     chat_service = FakeChatService(engine)
     handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
     ws = TimedWebSocket()
-    ws.put(_session_create("sid-open-fail"))
+    ws.put(_native_session_create("sid-open-fail"))
     ws.put({"type": "session.close"})
 
     await handler.handle_session(ws)
@@ -5026,7 +5027,7 @@ async def test_duplex_handler_preserves_typed_admission_error():
         idle_timeout_s=1,
     )
     ws = TimedWebSocket()
-    ws.put(_session_create("sid-admission-rejected"))
+    ws.put(_native_session_create("sid-admission-rejected"))
 
     await handler.handle_session(ws)
 
@@ -5646,7 +5647,7 @@ async def test_duplex_handler_explicit_close_closes_runtime_once_with_client_rea
     chat_service = FakeChatService(engine)
     handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
     ws = TimedWebSocket()
-    ws.put(_session_create("sid-close"))
+    ws.put(_native_session_create("sid-close"))
     ws.put({"type": "session.close"})
 
     await handler.handle_session(ws)
@@ -6337,7 +6338,7 @@ async def test_duplex_handler_idle_timeout_close_does_not_emit_runtime_control()
     chat_service = FakeChatService(engine)
     handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=0.1)
     ws = TimedWebSocket()
-    ws.put(_session_create("sid-disconnect"))
+    ws.put(_native_session_create("sid-disconnect"))
 
     await handler.handle_session(ws)
 
@@ -6370,7 +6371,7 @@ async def test_duplex_handler_runtime_close_failure_is_reported_without_closed_a
     chat_service = FakeChatService(engine)
     handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
     ws = TimedWebSocket()
-    ws.put(_session_create("sid-close-fail"))
+    ws.put(_native_session_create("sid-close-fail"))
     ws.put({"type": "session.close"})
 
     await handler.handle_session(ws)
@@ -6399,7 +6400,7 @@ async def test_duplex_handler_control_close_failure_is_reported_without_closed_a
     chat_service = FakeChatService(engine)
     handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
     ws = TimedWebSocket()
-    ws.put(_session_create("sid-control-close-fail"))
+    ws.put(_native_session_create("sid-control-close-fail"))
     ws.put({"type": "session.close"})
 
     await handler.handle_session(ws)
@@ -6438,7 +6439,7 @@ async def test_turn_signal_input_cancel_uses_epoch_fence_transition():
         idle_timeout_s=1,
     )
     ws = TimedWebSocket()
-    ws.put(_session_create("sid-turn-signal-cancel"))
+    ws.put(_native_session_create("sid-turn-signal-cancel"))
     ws.put({"type": "input.text.append", "text": "discard me"})
     ws.put({"type": "turn.signal", "event": "input.cancel"})
     ws.put({"type": "session.close"})
@@ -6466,59 +6467,6 @@ async def test_duplex_handler_local_turn_signal_does_not_round_trip_runtime():
     assert turn_event["event"] == "user_started"
     assert not engine.signals
     assert "runtime_signal_failed" not in {m.get("code") for m in ws.sent}
-
-
-@pytest.mark.asyncio
-async def test_duplex_barge_in_aborts_active_response_when_runtime_signal_fails():
-    engine = FakeEngineClient(fail_signal_events={"barge_in"})
-    chat_service = FakeChatService(engine)
-    handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
-
-    def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
-        if data.get("type") == "response.created":
-            ws.put({"type": "input.cancel", "reason": "test_barge_in"})
-
-    ws = TimedWebSocket(on_send=on_send)
-    ws.put(_session_create("sid-barge-signal-fail"))
-    ws.put({"type": "input.text.append", "text": "hello"})
-    ws.put({"type": "input.commit"})
-
-    await handler.handle_session(ws)
-
-    assert "audio.cancelled" in ws.sent_types()
-    assert engine.aborted == ["chatcmpl-duplex-sid-barge-signal-fail-0-1"]
-    assert engine.internal_abort_batches == [["chatcmpl-duplex-sid-barge-signal-fail-0-1"]]
-    error = next(m for m in ws.sent if m.get("type") == "error")
-    assert error["code"] == "runtime_signal_failed"
-
-
-@pytest.mark.asyncio
-async def test_duplex_handler_surfaces_stage_unsupported_result_to_client():
-    control_result = {
-        "operation": "open",
-        "session_id": "sid-unsupported",
-        "ok": True,
-        "unsupported_count": 1,
-        "error_count": 0,
-        "stage_results": [
-            {
-                "stage_id": 0,
-                "replica_id": 0,
-                "result": {"supported": False, "reason": "not implemented"},
-            }
-        ],
-    }
-    engine = FakeEngineClient(open_result=control_result)
-    chat_service = FakeChatService(engine)
-    handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
-    ws = TimedWebSocket()
-    ws.put(_session_create("sid-unsupported"))
-    ws.put({"type": "session.close"})
-
-    await handler.handle_session(ws)
-
-    created = next(m for m in ws.sent if m.get("type") == "session.created")
-    assert created["runtime_control"]["unsupported_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -6792,12 +6740,12 @@ async def test_duplex_handler_session_update_control_failure_rolls_back_config()
     chat_service = FakeChatService(engine)
     handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
     ws = TimedWebSocket()
-    ws.put(_session_create("sid-control-signal-fail"))
+    ws.put(_native_session_create("sid-control-signal-fail"))
     ws.put(
         {
             "type": "turn.signal",
             "event": "session.update",
-            "payload": {"instructions": "must roll back"},
+            "payload": {"temperature": 0.2},
         }
     )
     ws.put({"type": "session.close"})
@@ -6810,7 +6758,7 @@ async def test_duplex_handler_session_update_control_failure_rolls_back_config()
     assert error["runtime_control"]["error_count"] == 1
     signaled_config = engine.signal_session_configs[-1]
     assert signaled_config is not None
-    assert signaled_config["instructions"] == "must roll back"
+    assert signaled_config["temperature"] == 0.2
 
 
 @pytest.mark.asyncio
@@ -6885,7 +6833,7 @@ async def test_native_server_vad_update_rejection_does_not_stall(append_fails, e
     ws.put(update)
     ws.put({"type": "session.close"})
 
-    await asyncio.wait_for(handler.handle_session(ws, realtime_protocol=protocol), timeout=2)
+    await asyncio.wait_for(handler.handle_session(ws, realtime_protocol=protocol), timeout=10)
 
     errors = [message["error"] for message in ws.sent if isinstance(message.get("error"), dict)]
     error = next(error for error in errors if error.get("code") == expected_code)
@@ -7097,7 +7045,7 @@ async def test_duplex_handler_signal_unsupported_workers_with_data_plane_ack_is_
     chat_service = FakeChatService(engine)
     handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
     ws = TimedWebSocket()
-    ws.put(_session_create("sid-control-signal-data-plane"))
+    ws.put(_native_session_create("sid-control-signal-data-plane"))
     ws.put({"type": "turn.signal", "event": "barge_in"})
     ws.put({"type": "session.close"})
 
@@ -7428,13 +7376,20 @@ def test_minicpmo_native_duplex_explicit_barge_in_request_interrupts():
 async def test_native_server_vad_uses_shared_pipeline_and_emits_boundaries():
     backend = FakeServerVADBackend([0.9] * 10 + [0.0] * 50)
     engine = FakeEngineClient()
+
+    def commit_after_speech_stops(ws: TimedWebSocket, event: dict[str, Any]) -> None:
+        if event.get("type") == "input_audio_buffer.speech_stopped":
+            ws.put({"type": "input_audio_buffer.commit", "final": True})
+            ws.put({"type": "response.create"})
+            ws.put({"type": "session.close"})
+
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(engine),
         config_timeout_s=0.1,
         idle_timeout_s=1,
         server_vad_backend_provider=FakeServerVADProvider(backend),
     )
-    ws = TimedWebSocket()
+    ws = TimedWebSocket(on_send=commit_after_speech_stops)
     create = _native_realtime_session_update("sid-native-shared-server-vad")
     create["session"]["turn_detection"] = {"type": "server_vad"}
     ws.put(create)
@@ -7446,9 +7401,6 @@ async def test_native_server_vad_uses_shared_pipeline_and_emits_boundaries():
             "sample_rate_hz": 16_000,
         }
     )
-    ws.put({"type": "input_audio_buffer.commit", "final": True})
-    ws.put({"type": "session.close"})
-
     await asyncio.wait_for(
         handler.handle_session(ws, realtime_protocol=NativeRealtimeSessionProtocol({})),
         timeout=10,

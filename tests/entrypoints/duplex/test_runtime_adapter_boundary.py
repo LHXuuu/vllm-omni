@@ -68,7 +68,10 @@ from types import SimpleNamespace
 
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 
-chat_service = SimpleNamespace(engine_client=SimpleNamespace())
+chat_service = SimpleNamespace(
+    engine_client=SimpleNamespace(),
+    model_config=SimpleNamespace(model="test-model"),
+)
 handler = OmniDuplexSessionHandler(chat_service=chat_service)
 if handler._serving_runtime_adapter is not None:
     raise SystemExit("generic handler silently selected a model serving adapter")
