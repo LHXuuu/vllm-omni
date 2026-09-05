@@ -14,11 +14,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from vllm_omni.experimental.fullduplex.openai.protocol import (
+from vllm_omni.entrypoints.duplex.protocol import (
     DuplexSession,
     DuplexSessionConfig,
 )
-from vllm_omni.experimental.fullduplex.openai.server_vad import (
+from vllm_omni.entrypoints.duplex.server_vad import (
     ServerVADConfig,
     ServerVADFrame,
     ServerVADPipeline,
