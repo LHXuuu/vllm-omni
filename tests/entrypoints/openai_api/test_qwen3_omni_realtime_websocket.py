@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import os
 import wave
+from pathlib import Path
 
 import pytest
 import websockets
@@ -41,6 +43,8 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = os.environ.get("VLLM_OMNI_TEST_QWEN3_OMNI_MODEL", "Qwen/Qwen3-Omni-30B-A3B-Instruct")
 SERVER_VAD_MODEL_PATH = os.environ.get("VLLM_OMNI_TEST_SILERO_VAD_MODEL_PATH")
+SERVER_VAD_INPUT_WAV = Path(__file__).resolve().parents[2] / "assets/minicpmo_4_5/response_required_16k.wav"
+SERVER_VAD_INPUT_SHA256 = "2e5fd4eb3ee434ce107ee3a0591fa624a33f7683c7462f45fe651c443c9af941"
 
 # Synthetic input for realtime E2E (``generate_synthetic_audio``); distinct cache file per phrase.
 REALTIME_SYNTH_PHRASE_TEXT = (
@@ -306,6 +310,16 @@ def _synthetic_pcm16_input(
     return _pcm16_mono_16k_from_wav_bytes(wav_bytes)
 
 
+def _server_vad_pcm16_input() -> bytes:
+    """Load the fixed single-turn speech fixture used by the Server VAD E2E."""
+    wav_bytes = SERVER_VAD_INPUT_WAV.read_bytes()
+    actual_sha256 = hashlib.sha256(wav_bytes).hexdigest()
+    assert actual_sha256 == SERVER_VAD_INPUT_SHA256, (
+        f"Server VAD input SHA256 mismatch: expected {SERVER_VAD_INPUT_SHA256}, got {actual_sha256}"
+    )
+    return _pcm16_mono_16k_from_wav_bytes(wav_bytes)
+
+
 def _assert_realtime_smoke(result: dict) -> None:
     out_pcm = result["output_pcm"]
     assert result["delta_events"] >= 1
@@ -408,7 +422,6 @@ class TestQwen3OmniRealtimeWebSocket:
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     @pytest.mark.parametrize("omni_server", realtime_server_vad_server_params, indirect=True)
-    @pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/7279")
     def test_server_vad_multi_turn_without_client_commit(
         self,
         cached_silero_vad_artifact: str,
@@ -420,7 +433,7 @@ class TestQwen3OmniRealtimeWebSocket:
         assert deploy.session_mode == "turn"
         assert deploy.async_chunk is True
         assert deploy.duplex_session.server_vad_model_path == SERVER_VAD_MODEL_PATH
-        pcm16 = _synthetic_pcm16_input()
+        pcm16 = _server_vad_pcm16_input()
 
         turns = asyncio.run(
             _run_server_vad_audio_roundtrips(
@@ -434,6 +447,11 @@ class TestQwen3OmniRealtimeWebSocket:
         )
 
         assert len(turns) == 2
+        updated_session = next(event["session"] for event in turns[0] if event["type"] == "session.updated")
+        effective_turn_detection = updated_session["audio"]["input"]["turn_detection"]
+        assert effective_turn_detection["type"] == "server_vad"
+        assert effective_turn_detection["create_response"] is True
+        assert effective_turn_detection["interrupt_response"] is False
         required_sequence = [
             "input_audio_buffer.speech_started",
             "input_audio_buffer.speech_stopped",
@@ -447,6 +465,9 @@ class TestQwen3OmniRealtimeWebSocket:
         response_ids: list[str] = []
         for events in turns:
             event_types = [event["type"] for event in events]
+            for event_type in required_sequence:
+                if event_type != "response.audio.delta":
+                    assert event_types.count(event_type) == 1, event_types
             positions = [event_types.index(event_type) for event_type in required_sequence]
             assert positions == sorted(positions)
 
@@ -457,9 +478,27 @@ class TestQwen3OmniRealtimeWebSocket:
             done = next(event for event in events if event["type"] == "response.done")["response"]
 
             assert started["item_id"] == stopped["item_id"] == committed["item_id"]
+            input_item_id = committed["item_id"]
+            history_events = [
+                event
+                for event in events
+                if event["type"] in {"conversation.item.added", "conversation.item.done"}
+                and event["item"]["id"] == input_item_id
+            ]
+            assert [event["type"] for event in history_events] == [
+                "conversation.item.added",
+                "conversation.item.done",
+            ]
+            assert all(event["item"]["role"] == "user" for event in history_events)
+            output_pcm = b"".join(
+                base64.b64decode(event["delta"])
+                for event in events
+                if event["type"] == "response.audio.delta" and event.get("delta")
+            )
+            assert output_pcm
             assert created["id"] == done["id"]
             assert done["status"] == "completed"
-            input_item_ids.append(committed["item_id"])
+            input_item_ids.append(input_item_id)
             response_ids.append(created["id"])
 
         assert len(set(input_item_ids)) == 2
