@@ -14,16 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import io
 import json
 import os
 import wave
-from pathlib import Path
 
 import pytest
 import websockets
 
+from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import validated_input_wav
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import (
     convert_audio_bytes_to_text,
@@ -43,8 +42,6 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = os.environ.get("VLLM_OMNI_TEST_QWEN3_OMNI_MODEL", "Qwen/Qwen3-Omni-30B-A3B-Instruct")
 SERVER_VAD_MODEL_PATH = os.environ.get("VLLM_OMNI_TEST_SILERO_VAD_MODEL_PATH")
-SERVER_VAD_INPUT_WAV = Path(__file__).resolve().parents[2] / "assets/minicpmo_4_5/response_required_16k.wav"
-SERVER_VAD_INPUT_SHA256 = "2e5fd4eb3ee434ce107ee3a0591fa624a33f7683c7462f45fe651c443c9af941"
 
 # Synthetic input for realtime E2E (``generate_synthetic_audio``); distinct cache file per phrase.
 REALTIME_SYNTH_PHRASE_TEXT = (
@@ -312,12 +309,7 @@ def _synthetic_pcm16_input(
 
 def _server_vad_pcm16_input() -> bytes:
     """Load the fixed single-turn speech fixture used by the Server VAD E2E."""
-    wav_bytes = SERVER_VAD_INPUT_WAV.read_bytes()
-    actual_sha256 = hashlib.sha256(wav_bytes).hexdigest()
-    assert actual_sha256 == SERVER_VAD_INPUT_SHA256, (
-        f"Server VAD input SHA256 mismatch: expected {SERVER_VAD_INPUT_SHA256}, got {actual_sha256}"
-    )
-    return _pcm16_mono_16k_from_wav_bytes(wav_bytes)
+    return _pcm16_mono_16k_from_wav_bytes(validated_input_wav().read_bytes())
 
 
 def _assert_realtime_smoke(result: dict) -> None:
@@ -450,6 +442,7 @@ class TestQwen3OmniRealtimeWebSocket:
         updated_session = next(event["session"] for event in turns[0] if event["type"] == "session.updated")
         effective_turn_detection = updated_session["audio"]["input"]["turn_detection"]
         assert effective_turn_detection["type"] == "server_vad"
+        assert effective_turn_detection["silence_duration_ms"] == 500
         assert effective_turn_detection["create_response"] is True
         assert effective_turn_detection["interrupt_response"] is False
         required_sequence = [
