@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections import defaultdict
 from types import SimpleNamespace
@@ -9,6 +9,7 @@ import torch
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
+    _extract_codec_delta,
     tts2code2wav_async_chunk,
     tts2code2wav_full_payload,
     tts2code2wav_token_only,
@@ -70,6 +71,44 @@ def _codes(payload) -> list[int]:
     assert payload.codes.audio.dtype == torch.long
     assert payload.codes.audio.ndim == 1
     return payload.codes.audio.tolist()
+
+
+def test_empty_full_payload_releases_consumer_wait_gate() -> None:
+    payload = tts2code2wav_full_payload(_manager(), None, _request("req"))
+
+    assert _codes(payload) == []
+    assert payload.meta.code_flat_numel == 0
+    assert payload.meta.left_context_size == 0
+    assert payload.meta.last_chunk is True
+    assert payload.meta.finished.item() is True
+
+
+@pytest.mark.parametrize("flat", [False, True])
+@pytest.mark.parametrize("audio_shape", [(0,), (0, 1)])
+def test_empty_device_codec_prefill_preserves_next_chunk(flat: bool, audio_shape: tuple[int, ...]) -> None:
+    audio = torch.empty(audio_shape, dtype=torch.long)
+    valid = torch.empty(0, dtype=torch.bool)
+    empty_output = (
+        {"codes.audio": audio, "meta.codec_frame_valid": valid}
+        if flat
+        else {"codes": {"audio": audio}, "meta": {"codec_frame_valid": valid}}
+    )
+    assert _extract_codec_delta(empty_output, "req") == []
+    manager = _manager()
+    request = _request("req")
+    assert tts2code2wav_async_chunk(manager, empty_output, request, False) is None
+    payload = tts2code2wav_async_chunk(manager, _delta(*range(25)), request, False)
+    assert payload is not None
+    assert _codes(payload) == [4218, 4218, 4218, *range(25)]
+    assert payload.meta.chunk_seq == 0
+
+
+def test_device_codec_validity_filters_terminal_token() -> None:
+    output = {
+        "codes": {"audio": torch.tensor([[2], [6561], [3]])},
+        "meta": {"codec_frame_valid": torch.tensor([True, False, True])},
+    }
+    assert _extract_codec_delta(output, "req") == [2, 3]
 
 
 @pytest.mark.parametrize(("count", "emitted"), [(24, False), (25, True), (26, True)])
@@ -158,9 +197,13 @@ def test_duplex_turn_end_waits_for_terminal_codec_flush() -> None:
 def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
     manager = _manager()
     request = _request("req")
-    request.additional_information = {
+    request.model_intermediate_buffer = {
         "codes": {"ref": [0.1, -0.1]},
         "meta": {"ref_audio_sr": 16000},
+    }
+    request.additional_information = {
+        "codes": {"ref": [0.9]},
+        "meta": {"ref_audio_sr": 8000},
     }
 
     payload = tts2code2wav_async_chunk(
@@ -183,10 +226,33 @@ def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
     assert payload.meta.turn_end is True
 
 
+def test_first_chunk_falls_back_to_legacy_reference_fields() -> None:
+    manager = _manager()
+    request = _request("req")
+    request.model_intermediate_buffer = {
+        "meta": {"ref_audio_sr": 16000},
+    }
+    request.additional_information = {
+        "codes": {"ref": [0.9]},
+        "meta": {"ref_audio_sr": 8000},
+    }
+
+    payload = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(*range(7), turn_end=True),
+        request,
+        True,
+    )
+
+    assert payload is not None
+    assert payload.codes.ref.tolist() == pytest.approx([0.9])
+    assert payload.meta.ref_audio_sr == 16000
+
+
 def test_full_payload_forwards_all_codes_and_request_metadata() -> None:
     manager = _manager()
     request = _request("req")
-    request.additional_information = {
+    request.model_intermediate_buffer = {
         "codes": {"ref": [0.1, -0.1]},
         "meta": {
             "ref_audio_sr": 16000,
@@ -244,12 +310,16 @@ def test_sync_token_only_reserves_codec_and_silence_slots() -> None:
     assert prompts[0]["additional_information"] is None
 
 
-def test_empty_final_releases_wait_gate_once() -> None:
+@pytest.mark.parametrize("with_validity", [False, True])
+def test_empty_final_releases_wait_gate_once(with_validity: bool) -> None:
     manager = _manager()
     request = _request("req")
 
-    final = tts2code2wav_async_chunk(manager, None, request, True)
-    duplicate = tts2code2wav_async_chunk(manager, None, request, True)
+    output = _delta() if with_validity else None
+    if output is not None:
+        output["meta"]["codec_frame_valid"] = torch.empty(0, dtype=torch.bool)
+    final = tts2code2wav_async_chunk(manager, output, request, True)
+    duplicate = tts2code2wav_async_chunk(manager, output, request, True)
 
     assert final is not None
     assert _codes(final) == []
@@ -423,6 +493,12 @@ def test_duplex_turn_end_closes_epoch_and_next_turn_restarts_sequence() -> None:
         request,
         True,
     )
+    duplicate_boundary = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(turn_id=7, turn_end=True),
+        request,
+        True,
+    )
     next_turn = tts2code2wav_async_chunk(
         manager,
         _duplex_delta(20, turn_id=8),
@@ -435,6 +511,10 @@ def test_duplex_turn_end_closes_epoch_and_next_turn_restarts_sequence() -> None:
     assert turn_end.meta.last_chunk is True
     assert turn_end.meta.turn_end is True
     assert turn_end.meta.is_segment_finished.item() is True
+    assert turn_end.meta.replace_runtime_additional_information is True
+    assert duplicate_boundary is not None
+    assert duplicate_boundary.meta.is_segment_finished.item() is True
+    assert duplicate_boundary.meta.replace_runtime_additional_information is True
     assert next_turn.meta.cache_epoch == turn_end.meta.cache_epoch + 1
     assert next_turn.meta.chunk_seq == 0
     assert next_turn.meta.last_chunk is False
@@ -472,3 +552,25 @@ def test_cancel_drops_epoch_state_and_stale_request_cannot_publish() -> None:
     assert payload is not None
     assert payload.meta.cache_epoch == 1
     assert _codes(payload) == [4218, 4218, 4218, *range(25)]
+
+
+@pytest.mark.parametrize("last_valid", [False, True])
+def test_full_payload_accumulates_codec_validity_per_frame(last_valid):
+    """A final invalid/EOS row must not invalidate the whole utterance."""
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin,
+    )
+
+    transport = _OmniConnectorPayloadTransportMixin()
+    transport._pending_full_payload_send = {}
+    transport._full_payload_replace_keys_cached = frozenset()
+    request = _request("req")
+    for code, valid in [(10, True), (0, False), (11, True), (12, last_valid)]:
+        transport.accumulate_full_payload_output(
+            "req",
+            {"codes.audio": torch.tensor([[code]]), "meta.codec_frame_valid": torch.tensor([valid])},
+            request,
+        )
+    full, _ = transport._materialize_full_payload_entry(transport._pending_full_payload_send["req"])
+    payload = tts2code2wav_full_payload(_manager(), full, request)
+    assert _codes(payload) == [4218, 4218, 4218, 10, 11] + ([12] if last_valid else [])
