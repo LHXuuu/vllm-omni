@@ -8,6 +8,7 @@ Covers:
 - pcm16 is mapped to pcm for soundfile compatibility
 - Default format is WAV when not specified
 - create_audio encodes correctly for each supported format
+- Streaming WAV clients decode PCM chunks and keep choices separate
 """
 
 from __future__ import annotations
@@ -288,8 +289,7 @@ class TestResolveAudioFormat:
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("fmt", ["pcm", "wav", "flac"])
-@pytest.mark.parametrize("channels", [1, 2])
-def test_chat_audio_metadata_survives_response_serialization(stream, fmt, channels):
+def test_chat_audio_metadata_survives_response_serialization(stream, fmt):
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.entrypoints.serve.engine.protocol import ErrorResponse, UsageInfo
 
@@ -307,13 +307,7 @@ def test_chat_audio_metadata_survives_response_serialization(stream, fmt, channe
         cumulative_logprob=None,
         logprobs=None,
         multimodal_output=MultimodalPayload.from_dict(
-            {
-                "audio": [
-                    torch.zeros(17) if channels == 1 else torch.zeros(2, 17),
-                    torch.zeros(23) if channels == 1 else torch.zeros(2, 23),
-                ],
-                "sr": torch.tensor(22050),
-            }
+            {"audio": [torch.zeros(17), torch.zeros(23)], "sr": torch.tensor(22050)}
         ),
         finish_reason="stop",
         stop_reason=None,
@@ -344,7 +338,7 @@ def test_chat_audio_metadata_survives_response_serialization(stream, fmt, channe
         "format": fmt,
         "sample_rate_hz": 22050,
         "frame_count": frame_count,
-        "channels": channels,
+        "channels": 1,
     }
     audio = choice["delta"]["content"] if stream else choice["message"]["audio"]["data"]
     raw = base64.b64decode(audio)
@@ -352,9 +346,9 @@ def test_chat_audio_metadata_survives_response_serialization(stream, fmt, channe
         with soundfile.SoundFile(BytesIO(raw)) as audio_file:
             assert audio_file.frames == frame_count
             assert audio_file.samplerate == 22050
-            assert audio_file.channels == channels
+            assert audio_file.channels == 1
     else:
-        assert len(raw) == frame_count * channels * 2
+        assert len(raw) == frame_count * 2
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -468,3 +462,123 @@ def test_float32_pcm_fast_path_matches_soundfile(layout):
         expected = buffer.getvalue()
     assert _float32_to_pcm16_bytes(audio) == expected
     np.testing.assert_array_equal(audio, original)
+
+
+@pytest.fixture
+def chat_wav_stream():
+    from vllm.entrypoints.generate.base.protocol import DeltaMessage
+    from vllm.entrypoints.serve.engine.protocol import UsageInfo
+
+    from vllm_omni.entrypoints.openai.audio_utils_mixin import create_wav_header
+    from vllm_omni.entrypoints.openai.protocol.chat_completion import (
+        OmniChatCompletionResponseStreamChoice,
+        OmniChatCompletionStreamResponse,
+    )
+
+    def build(channels):
+        waveforms = {}
+        for index in (1, 0):
+            left = np.array([1000, -2000, 3000, -4000, 5000], dtype="<i2") + index * 1000
+            waveforms[index] = np.column_stack((left, -left)) if channels == 2 else left[:, None]
+
+        def event(index, content, modality="audio"):
+            return OmniChatCompletionStreamResponse(
+                id="chatcmpl-client-test",
+                created=0,
+                model="test-model",
+                modality=modality,
+                choices=[OmniChatCompletionResponseStreamChoice(index=index, delta=DeltaMessage(content=content))],
+            )
+
+        chunks = [event(index, "") for index in (1, 0)]
+        for start, end in [(0, 2), (2, 5)]:
+            for index in (1, 0):
+                pcm = waveforms[index][start:end].astype("<i2").tobytes()
+                if start == 0:
+                    pcm = create_wav_header(22050 + index * 1950, channels) + pcm
+                chunks.append(event(index, base64.b64encode(pcm).decode()))
+                if start == 0:
+                    chunks.append(event(index, f"choice-{index}", modality="text"))
+        chunks.append(
+            OmniChatCompletionStreamResponse(
+                id="chatcmpl-client-test",
+                created=0,
+                model="test-model",
+                choices=[],
+                usage=UsageInfo(prompt_tokens=3, completion_tokens=5, total_tokens=8),
+            )
+        )
+        return chunks, waveforms
+
+    return build
+
+
+def test_online_client_decodes_wav_stream_without_mixing_choices(chat_wav_stream):
+    import time
+
+    from tests.helpers.client import OnlineOmniClient
+
+    chunks, waveforms = chat_wav_stream(channels=2)
+    client = OnlineOmniClient(port=8091, log_stats=False)
+    for _ in range(2):
+        result = client._process_stream_omni_response(iter(chunks), wall_start=time.perf_counter())
+        assert result.success
+        assert result.audio_bytes is not None
+        decoded, sr = soundfile.read(BytesIO(result.audio_bytes), dtype="float32", always_2d=True)
+        assert sr == 22050
+        np.testing.assert_array_equal(decoded, waveforms[0].astype(np.float32) / 32768)
+        assert result.text_content == "choice-0"
+        assert result.prompt_tokens == 3
+        assert result.request_id == "chatcmpl-client-test"
+
+
+@pytest.mark.parametrize("demo_name", ["qwen2_5_omni", "qwen3_omni"])
+@pytest.mark.parametrize("channels", [1, 2])
+def test_gradio_chat_stream_outputs_each_audio_chunk_once(demo_name, channels, chat_wav_stream, monkeypatch, mocker):
+    import os
+    import random
+    import sys
+    from importlib import import_module
+    from types import ModuleType
+
+    from openai import OpenAI
+
+    # Run the API generator without starting Gradio or seeding devices.
+    gradio = ModuleType("gradio")
+    monkeypatch.setattr(gradio, "skip", lambda: {"__type__": "update"}, raising=False)
+    monkeypatch.setitem(sys.modules, "gradio", gradio)
+    mocker.patch.object(random, "seed")
+    mocker.patch.object(np.random, "seed")
+    mocker.patch.object(torch, "manual_seed")
+    mocker.patch.object(torch.cuda, "manual_seed")
+    mocker.patch.object(torch.cuda, "manual_seed_all")
+    for name in ("deterministic", "benchmark"):
+        monkeypatch.setattr(torch.backends.cudnn, name, getattr(torch.backends.cudnn, name))
+    for name in ("PYTHONHASHSEED", "CUBLAS_WORKSPACE_CONFIG"):
+        monkeypatch.setenv(name, os.environ.get(name, ""))
+    demo = import_module(f"examples.online_serving.{demo_name}.gradio_demo")
+    monkeypatch.setattr(demo, "gr", gradio)
+
+    chunks, waveforms = chat_wav_stream(channels)
+    client = OpenAI(api_key="EMPTY", base_url="http://127.0.0.1:8091/v1")
+    completion = mocker.patch.object(client.chat.completions, "create")
+    for _ in range(2):
+        completion.return_value = iter(chunks)
+        updates = list(
+            demo.run_inference_api(client, "test-model", [], "Hello", output_modalities="audio", stream=True)
+        )
+
+        assert all("failed" not in text.lower() for text, _ in updates)
+        audio_updates = [audio for _, audio in updates if isinstance(audio, tuple)]
+        expected_chunks = [(index, start, end) for start, end in [(0, 2), (2, 5)] for index in (1, 0)]
+        assert len(audio_updates) == len(expected_chunks)
+        for (sr, decoded), (index, start, end) in zip(audio_updates, expected_chunks):
+            assert sr == 22050 + index * 1950
+            expected = waveforms[index][start:end].astype(np.float32) / 32768
+            if channels == 1:
+                expected = expected[:, 0]
+            np.testing.assert_array_equal(decoded, expected)
+
+        # Text updates and completion must not send the previous audio chunk again.
+        assert updates[-1][1] == {"__type__": "update"}
+        assert all(audio == {"__type__": "update"} for _, audio in updates if not isinstance(audio, tuple))
